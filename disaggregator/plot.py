@@ -688,3 +688,21 @@ def color_name2hex(**kwargs):
     sheet_name = cfg['userdef_colors']['sheet_colors']
     return pd.read_excel(f, sheet_name=sheet_name,
                          index_col='Python Name')['Hex'].to_dict()
+
+    
+def temporal_plot_function(df):
+    fig, ax = plt.subplots(figsize=(20, 4))
+    # the separate WZ
+    if df.columns.nlevels == 2:
+        grouped_df = df.groupby("WZ", axis = 1).sum()
+        for WZ in grouped_df:
+            grouped_df[WZ].plot(ax = ax, label = ("WZ " + str(WZ)))
+    # whole consumption
+    elif df.columns.nlevels == 1:
+        df.sum(axis = 1).plot(ax = ax, label = "Gesamt")
+    else:
+        raise ValueError("unexpected Input")
+    for col in df:
+        df[col].plot(ax = ax, label = col)
+    plt.legend(loc = "upper left", bbox_to_anchor=(1.02, 0.9))
+    return fig, ax
