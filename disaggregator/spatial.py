@@ -25,7 +25,7 @@ from .data import (elc_consumption_HH, heat_consumption_HH, gas_consumption_HH,
                    living_space, hotwater_shares, heat_demand_buildings,
                    employees_per_branch, efficiency_enhancement,
                    generate_specific_consumption_per_branch_and_district)
-from .config import (dict_region_code, get_config)
+from .config import (dict_region_code, get_config, data_in)
 import numpy as np
 import pandas as pd
 import logging
@@ -403,16 +403,21 @@ def disagg_CTS_industry(source, sector,
                                                 values='natcode_nuts3'))
     return df
 
-def disagg_applications(source, sector, use_nuts3code = False, no_self_gen = False, **kwargs): #**kwargs
+
+def disagg_applications(source, sector, disagg_ph=False, use_nuts3code=False,
+                        no_self_gen=False,  **kwargs):  # **kwargs
     """
     Perfrom dissagregation based on applications of the final energy usage
-    
+
     Parameters
     ----------
     source : str
         must be one of ['power', 'gas']
     sector : str
         must be one of ['CTS', 'industry']
+    disagg_ph : bool, default False
+        If True: returns industrial gas consumption fpr process heat by
+                 temperature level
     use_nuts3code : bool, default False
         throughput for
         disagg_CTS_industry(
@@ -432,72 +437,99 @@ def disagg_applications(source, sector, use_nuts3code = False, no_self_gen = Fal
         columns = Branches / Applications
     """
     assert (source in ['power', 'gas']), "`source` must be in ['power', 'gas']"
-    assert (sector in ['CTS', 'industry']), "`sector` must be in ['CTS', 'industry']"
-    
+    assert (sector in ['CTS', 'industry']),\
+        "`sector` must be in ['CTS', 'industry']"
+
     # check if a year was specified
+    cfg = kwargs.get('cfg', get_config())
     year = kwargs.get("year", cfg["base_year"])
-    
+
     # reading and preapring the consumption table
-    
     # reading the disaggregation keys table
-    no_year_error = "For the specified year no application disaggregation keys were found, using the base year 2015. Try adjusting the file in 'data_in/dimensionless'."
     PATH = data_in("dimensionless", "application_disaggreagtion_keys.xlsx")
-    
+
     if source == "power":
-        try:
-            eev = pd.read_excel(PATH, sheet_name = "Endenergieverbrauch Strom "+str(year))
-        except:
-            print(no_year_error)
-            eev = pd.read_excel(PATH, sheet_name = "Endenergieverbrauch Strom 2015")
+        eev = pd.read_excel(PATH, sheet_name=("Endenergieverbrauch Strom"))
+
     if source == "gas":
-        try:
-            eev = pd.read_excel(PATH, sheet_name = "Endenergieverbrauch Gas "+str(year))
-        except:
-            print(no_year_error)
-            eev = pd.read_excel(PATH, sheet_name = "Endenergieverbrauch Gas 2015")
-    
+        eev = pd.read_excel(PATH, sheet_name=("Endenergieverbrauch Gas"))
+        if disagg_ph:  # read temperature level disaggregation factors
+            ft = pd.read_excel(PATH,
+                               sheet_name=("Prozesswärme_Temperaturniveaus"))
+            # cleaning the table
+            # selecting only the rows with WZ and not the name columns
+            ft_clean = ft.loc[[isinstance(x, int) for x in ft["WZ"]]]
+            # use WZ as index for further operations
+            ft_clean = ft_clean.set_index("WZ")
+
     # cleaning the table
-    eev_clean = eev.loc[[isinstance(x, int) for x in eev["WZ"]]] # selecting only the rows with WZ and not the name columns
+    # selecting only the rows with WZ and not the name columns
+    eev_clean = eev.loc[[isinstance(x, int) for x in eev["WZ"]]]
     # use WZ as index for further operations
     eev_clean = eev_clean.set_index("WZ")
-    
-    # calling the spatial disaggregation function which will be further disaggregated
-    if sector == "CTS":
-        ec = disagg_CTS_industry(source, sector, use_nuts3code, no_self_gen, year = year)
-    if sector == "industry":
-        ec = disagg_CTS_industry(source, sector, use_nuts3code, no_self_gen, year = year) 
-        
-    # kepping only the data for the branches that are relevant
-    usage = eev_clean.loc[ec.index]
 
-    # for better acces
+    # calling the spatial disaggregation function which will be further
+    # disaggregated
+    if sector == "CTS":
+        ec = disagg_CTS_industry(source, sector, use_nuts3code, no_self_gen,
+                                 year=year)
+        # kepping only the data for the branches that are relevant
+        usage = eev_clean.loc[ec.index]
+        if disagg_ph:
+            # check if disaggregation per temperature level is wanted
+            print("Message: No disaggregation on temperature-levels has "
+                      "been done, since there is no data for CTS-sector.")
+    if sector == "industry":
+        ec = disagg_CTS_industry(source, sector, use_nuts3code, no_self_gen,
+                                 year=year)
+        # kepping only the data for the branches that are relevant
+        usage = eev_clean.loc[ec.index]
+        if disagg_ph:
+            # check if disaggregation per temperature level is wanted
+            if source == "power":
+                # check if source is power, in this case there is no
+                # disaggregation on temperature-level possible
+                print("Message: No disaggregation on temperature-levels has "
+                      "been done, since there is no data for electricity.")
+            else:
+                # disaggregate process heat into temperature levels by
+                # multipling factor for process heat with factors for
+                # temperature levels
+                usage = (usage.join(ft_clean[['Prozesswärme <100°C',
+                                              'Prozesswärme 100°C-200°C',
+                                              'Prozesswärme 200°C-500°C',
+                                              'Prozesswärme >500°C']]
+                                    .multiply(usage['Prozesswärme'],
+                                              axis='index'))
+                         # drop coloumn process heat, since it is now split
+                         # into temperature- levels and not needed anymore
+                         .drop('Prozesswärme', axis=1))
+    # for better acces, transpose DataFrame to have NUTS3-regions in index
     ec = ec.T
-    
     # creating the multiindex
-    multi_wz = [elem for elem in list(ec.columns) for _ in range(len(eev_clean.columns))]
+    multi_wz = [elem for elem in list(ec.columns) for _ in
+                range(len(usage.columns))]
     multi_app = list(usage.columns[:]) * len(usage.index)
-    
+
     tuples = list(zip(*[multi_wz, multi_app]))
-    columns = pd.MultiIndex.from_tuples(tuples, names = ["WZ", "AWB"])
-    
+    columns = pd.MultiIndex.from_tuples(tuples, names=["WZ", "AWB"])
+
     # creating a new datafame with the multiindex
-    new_df = pd.DataFrame(columns = columns, index = ec.index)
-    
+    new_df = pd.DataFrame(columns=columns, index=ec.index)
+
     # filling the new dataframe
     # multiplying the values for every wz with the application keys
-    for wz in new_df.columns.get_level_values(0).unique(): # all wz
-        for app in new_df.columns.get_level_values(1).unique(): # all applications
+    for wz in new_df.columns.get_level_values(0).unique():  # all wz
+        for app in new_df.columns.get_level_values(1).unique():  # all applics
             percent = usage.loc[wz, app]
             new_df[wz, app] = ec[wz] * percent
-            
+
     # Plausibility check:
     msg = ('The sum of consumptions (={:.3f}) and the sum of disaggrega'
            'ted consumptions (={:.3f}) do not match! Please check algorithm!')
     total_sum = ec.sum().sum()
     disagg_sum = new_df.sum().sum()
     assert np.isclose(total_sum, disagg_sum), msg.format(total_sum, disagg_sum)
-    
-    
     return new_df
 
 
