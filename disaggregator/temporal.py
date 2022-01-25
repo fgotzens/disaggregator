@@ -31,7 +31,7 @@ from .data import (elc_consumption_HH, households_per_size, population,
                    shift_load_profile_generator, gas_slp_weekday_params,
                    percentage_EFH_MFH, regional_branch_load_profiles)
 from .spatial import (disagg_CTS_industry, disagg_households_power,
-                      disagg_households_gas)
+                      disagg_households_gas, disagg_applications)
 from datetime import timedelta
 import numpy as np
 import pandas as pd
@@ -299,13 +299,12 @@ def create_projection(df, target_year, by, **kwargs):
     return df.multiply(keys, axis='index')
 
 
-def disagg_temporal_applications(source, sector, detailed = False, use_nuts3code = False, wz = None, **kwargs): 
+def disagg_temporal_applications(source, sector, detailed=False, state=None,
+                                 use_nuts3code=False, wz=None, disagg_ph=False,
+                                 **kwargs):
     """
-    verschiebbarkeit
-    
-
     Perform dissagregation based on applications of the final energy usage
-    
+
     Parameters
     ----------
     source : str
@@ -313,84 +312,93 @@ def disagg_temporal_applications(source, sector, detailed = False, use_nuts3code
     sector : str
         must be one of ['CTS', 'industry']
     detailed : bool, default False
-        If True energy use per branch and disctrict get disaggreagated. Otherwise just the energy use per district
+        Throughput to functions disagg_temporal_industry(),
+        disagg_temporal_gas_CTS() and disagg_temporal_power_CTS(). If True
+        energy use per branch and disctrict get disaggreagated.
+        Otherwise just the energy use per district
     use_nuts3code : bool, default False
         throughput for
-        temporal disaggregation functions
+        spatial disaggregation functions
         If True use NUTS-3 codes as region identifiers.
     wz: int or list
         necessary if detailed = True
         All the branches that are to be analysed.
-    
+    disagg_ph : bool, default False
+        If True: returns industrial gas consumption fpr process heat by
+                 temperature level
+    state : str, default None
+        Defines state for disaggregation. Needs to be defined, if detailed=True
+
     Returns
     -------
     pd.DataFrame
         index = datetimeindex
         columns = Districts / (Branches) / Applications
     """
-
+    # Step1: Read Input data
     # variable check
-    assert source in ["power", "gas"], "'source' needs to be 'power' or 'gas'"
-    assert sector in ["CTS", "industry"], "'sector' needs to be 'CTS' or 'industry'"
+    assert (source in ['power', 'gas']), "`source` must be in ['power', 'gas']"
+    assert (sector in ['CTS', 'industry']),\
+        "`sector` must be in ['CTS', 'industry']"
 
     # check if a year was specified
+    cfg = kwargs.get('cfg', get_config())
     year = kwargs.get("year", cfg["base_year"])
+    # troughput values for the helper function, used for industrial disagg
+    low = kwargs.get("low", 0.4)
+    no_self_gen = kwargs.get("no_self_gen", False)
     
     # reading and preapring the consumption table
-    
     # reading the disaggregation keys table
-    no_year_error = "For the specified year no application disaggregation keys were found, using the base year 2015. Try adjusting the file in 'data_in/dimensionless'."
     PATH = data_in("dimensionless", "application_disaggreagtion_keys.xlsx")
-    
+
     if source == "power":
-        try:
-            eev = pd.read_excel(PATH, sheet_name = "Endenergieverbrauch Strom "+str(year))
-        except:
-            print(no_year_error)
-            eev = pd.read_excel(PATH, sheet_name = "Endenergieverbrauch Strom 2015")
+        eev = pd.read_excel(PATH, sheet_name=("Endenergieverbrauch Strom"))
+
     if source == "gas":
-        try:
-            eev = pd.read_excel(PATH, sheet_name = "Endenergieverbrauch Gas "+str(year))
-        except:
-            print(no_year_error)
-            eev = pd.read_excel(PATH, sheet_name = "Endenergieverbrauch Gas 2015")
-    
-    
+        eev = pd.read_excel(PATH, sheet_name=("Endenergieverbrauch Gas"))
+        if disagg_ph:  # read temperature level disaggregation factors
+            ft = pd.read_excel(PATH,
+                               sheet_name=("Prozesswärme_Temperaturniveaus"))
+            # cleaning the table
+            # selecting only the rows with WZ and not the name columns
+            ft_clean = ft.loc[[isinstance(x, int) for x in ft["WZ"]]]
+            # use WZ as index for further operations
+            ft_clean = ft_clean.set_index("WZ")
+
     # cleaning the table
-    eev_clean = eev.loc[[isinstance(x, int) for x in eev["WZ"]]] # selecting only the rows with WZ and not the name columns
+    # selecting only the rows with WZ and not the name columns
+    eev_clean = eev.loc[[isinstance(x, int) for x in eev["WZ"]]]
     # use WZ as index for further operations
     eev_clean = eev_clean.set_index("WZ")
-    
-    # if there are 4 or 8 different applications
+
+    # check how many different applications there are
     amount_application = len(eev_clean.columns)
-    
-    
-    #############################################
-    # creating the temporal dataset
+
+    # Step2: Create temporal dataset
+    # industry
     if sector == "industry":
         # troughput values for the helper function
-        low = kwargs.get("low", 0.35)
+        low = kwargs.get("low", 0.4)
         no_self_gen = kwargs.get("no_self_gen", False)
-        
-        ec = disagg_temporal_industry(source, detailed, use_nuts3code, low, no_self_gen, year = year)
-    
+
+        ec = disagg_temporal_industry(source, detailed, use_nuts3code, low,
+                                      no_self_gen, year=year)
     # CTS
     else:
         if source == "gas":
             # this one has a different methodology
-            ec = disagg_temporal_gas_CTS(detailed, use_nuts3code, year = year)
-            # wrong column names
+            ec = disagg_temporal_gas_CTS(detailed, use_nuts3code, year=year)
+            # wrong column names are corrected
             if detailed:
                 ec.columns = ec.columns.set_names(["LK", "WZ"])
             else:
                 ec.columns = ec.columns.set_names(["LK"])
         # power
         else:
-            ec = disagg_temporal_power_CTS(detailed, use_nuts3code, year = year)
-      
+            ec = disagg_temporal_power_CTS(detailed, use_nuts3code, year=year)
 
-    ############################################
-    
+    # Step3: Create temporal dataset
     # check if WZ are grouped together
     if not detailed:
         # values from the averages of the spatial disagg function
@@ -485,6 +493,218 @@ def disagg_temporal_applications(source, sector, detailed = False, use_nuts3code
     assert np.isclose(total_sum, disagg_sum), msg.format(total_sum, disagg_sum)
     
    
+    return new_df
+
+
+def disagg_temporal_applications_new(source, sector, detailed=False,
+                                     state=None, use_nuts3code=False,
+                                     disagg_ph=False, use_blp=True, **kwargs):
+    """
+    Perform dissagregation based on applications of the final energy usage
+
+    Parameters
+    ----------
+    source : str
+        must be one of ['power', 'gas']
+    sector : str
+        must be one of ['CTS', 'industry']
+    detailed : bool, default False
+        Throughput to functions disagg_temporal_industry(),
+        disagg_temporal_gas_CTS() and disagg_temporal_power_CTS(). If True
+        energy use per branch and disctrict get disaggreagated.
+        Otherwise just the energy use per district
+    use_nuts3code : bool, default False
+        throughput for
+        spatial disaggregation functions
+        If True use NUTS-3 codes as region identifiers.
+    disagg_ph : bool, default False
+        If True: returns industrial gas consumption fpr process heat by
+                 temperature level
+    state : str, default None
+        Defines state for disaggregation. Needs to be defined, if detailed=True
+    use_blp: bool, default True
+        If True, branch load profiles (blp) are used if available. blp are
+        based on measured consumption data gathered during DemandRegio project.
+
+    Returns
+    -------
+    pd.DataFrame
+        index = datetimeindex
+        columns = Districts / (Branches) / Applications
+    """
+    # Step1: Read Input data
+    # variable check
+    assert (source in ['power', 'gas']), "`source` must be in ['power', 'gas']"
+    assert (sector in ['CTS', 'industry']),\
+        "`sector` must be in ['CTS', 'industry']"
+
+    # check if a year was specified
+    cfg = kwargs.get('cfg', get_config())
+    year = kwargs.get("year", cfg["base_year"])
+    # troughput values for the helper function, used for industrial disagg
+    low = kwargs.get("low", 0.4)
+    no_self_gen = kwargs.get("no_self_gen", False)
+
+    # perfom spatial disagg of demand per consumer group and application
+    df_app = disagg_applications(source, sector, disagg_ph,
+                                 use_nuts3code, no_self_gen, year=year)
+    # count how many different applications there are
+    amount_application = len(df_app.columns.unique(level=1))
+    # count how many different wz (industrial/commercial branches) there are
+    amount_wz = len(df_app.columns.unique(level=0))
+
+    if not detailed:  # check if result should be detailed
+        # Create temporal dataset
+        # industry
+        if sector == "industry":
+            if use_blp:
+                assert (source in ['power']), ("`source` must be in set to "
+                                               "'power' if use_blp=True")
+                ec = disagg_temporal_industry_blp(source, detailed,
+                                                  use_nuts3code, low,
+                                                  no_self_gen, year=year)
+            else:
+                ec = disagg_temporal_industry(source, detailed, use_nuts3code,
+                                              low, no_self_gen, year=year)
+        # CTS
+        else:
+            if source == "gas":
+                # this one has a different methodology
+                ec = disagg_temporal_gas_CTS(detailed, use_nuts3code,
+                                             year=year)
+                # wrong column names are corrected
+                ec.columns = ec.columns.set_names(["LK"])
+            # power
+            else:
+                if use_blp:
+                    ec = disagg_temporal_power_CTS_blp(detailed, use_nuts3code,
+                                                       year=year)
+                else:
+                    ec = disagg_temporal_power_CTS(detailed, use_nuts3code,
+                                                   year=year)
+        # Create temporal dataset with multiindex
+        # creating the multiindex
+        multi_lk = [elem for elem in list(ec.columns)
+                    for _ in range(amount_application)]
+        multi_app = list(df_app.columns.unique(level=1)) * len(ec.columns)
+        tuples = list(zip(*[multi_lk, multi_app]))
+        index = pd.MultiIndex.from_tuples(tuples, names=["LK", "Anwendung"])
+
+        # new df with multiindex columns and datetime as index
+        new_df = pd.DataFrame(columns=index, index=ec.index)
+
+        # print info on the process
+        logger.info("Working on disaggregating the applications for each "
+                    "NUTS-3 region.")
+
+        # percentage-values from the averages of the spatial disagg function
+        # by region and application to use for multiplication
+        percentages = (df_app.mean(level=1, axis=1)
+                       .div(df_app.mean(level=1, axis=1).sum(axis=1), axis=0))
+        # for every lk multiply the consumption with the percentual use for
+        # that application
+        for lk in ec.columns:
+            for app in df_app.columns.unique(level=1):
+                new_df[lk, app] = percentages.loc[lk, app] * ec[lk]
+
+    else:  # results will be "detailed"
+        assert state in list(bl_dict().values()), ("'state' needs to be in "
+                                                   "['SH', 'HH', 'NI', 'HB', "
+                                                   "'NW', 'HE', 'RP', 'BW', "
+                                                   "'BY', 'SL', 'BE', 'BB', "
+                                                   "'MV', 'SN', 'ST', 'TH']")
+        assert isinstance(state, str), "'state' needs to be a string."
+        # create temporal dataset
+		# industry
+        if sector == "industry":
+            if use_blp:
+                assert (source in ['power']), ("`source` must be in set to "
+                                               "'power' if use_blp=True")
+                ec = disagg_temporal_industry_blp_by_state(source, detailed,
+                                                           use_nuts3code, low,
+                                                           no_self_gen,
+                                                           state=state,
+                                                           year=year)
+            else:
+                ec = disagg_temporal_industry_by_state(source, detailed,
+                                                       use_nuts3code, low,
+                                                       no_self_gen, 
+                                                       state=state, year=year)
+        # CTS
+        else:
+            if source == "gas":
+                ec = disagg_temporal_gas_CTS_by_state(detailed, use_nuts3code,
+                                                      state=state, year=year)
+                # wrong column names are corrected
+                ec.columns = ec.columns.set_names(["LK", "WZ"])
+            # power
+            else:
+                if use_blp:
+                    ec = disagg_temporal_power_CTS_blp_by_state(detailed,
+                                                                use_nuts3code,
+                                                                state=state,
+                                                                year=year)
+                else:
+                    ec = disagg_temporal_power_CTS_by_state(detailed,
+                                                            use_nuts3code,
+                                                            state=state,
+                                                            year=year)
+        # number of regions
+        regions = list(ec.columns.get_level_values(0).unique())
+        amount_regions = len(regions)
+        # creating the multiindex
+        multi_lk = [elem for elem in regions
+                    for _ in range(amount_application * amount_wz)]
+        multi_wz = [elem for elem in df_app.columns.unique(level=0)
+                    for _ in range(amount_application)] * amount_regions
+        multi_app = (list(df_app.columns.unique(level=1))
+                     * amount_regions
+                     * amount_wz)
+        tuples = list(zip(*[multi_lk, multi_wz, multi_app]))
+        columns = pd.MultiIndex.from_tuples(tuples, names=["LK", "WZ",
+                                                           "Anwendungen"])
+
+        # new df with multiindex columns and datetime as index
+        new_df = pd.DataFrame(columns=columns, index=ec.index)
+        # optional, give memory usage info
+		# logger.info('Approximate memory usage of Dataframe in MB will be: '
+        #           + str(new_df.memory_usage(deep=True).sum()/1000000))
+
+        # percentage-values from the averages of the spatial disagg function
+        # by region, industrial branch and application to use for multiplication
+        percentages = (df_app.div(df_app.sum(axis=1, level=0), level=0).mean())
+
+        i = 1  # lk counter
+        # for every lk and WZ multiply the consumption with the percentual
+        # use for that application
+        for lk in new_df.columns.get_level_values(0).unique():  # all districts
+            # provide info how far along the function is
+            if i % 50 == 0:
+                logger.info("Working on LK {}/{}."
+                            .format(i+1, len(new_df.columns.get_level_values(0)
+                                             .unique())))
+            i += 1
+            for branch in new_df.columns.get_level_values(1).unique():
+                for app in new_df.columns.get_level_values(2).unique():
+                    new_df[lk, branch, app] = (percentages.loc[branch, app]
+                                               * ec[lk, branch])
+
+    # Plausibility check:
+    msg = ('The sum of consumptions (={:.3f}) and the sum of disaggrega'
+           'ted consumptions (={:.3f}) do not match! Please check algorithm!')
+    if detailed:
+        # adding the complete consumption for every given branch before the
+        # disaggregation
+        total_sum = 0
+        for branch in new_df.columns.get_level_values(1).unique():
+            total_sum += ec.xs(branch, level="WZ", axis=1).sum().sum()
+    else:
+        # consumption trough all timesteps in every district
+        total_sum = ec.sum().sum()
+    # total sum of all disaggregated consumptions
+    disagg_sum = new_df.sum().sum()
+    assert np.isclose(total_sum, disagg_sum), msg.format(total_sum, disagg_sum)
+
     return new_df
 
 
@@ -820,6 +1040,256 @@ def disagg_temporal_power_CTS_blp(detailed=False, use_nuts3code=False,
     return total_demand
 
 
+def disagg_temporal_power_CTS_blp_by_state(detailed=False, use_nuts3code=False,
+                                           state=None, **kwargs):
+    """
+    Disagreggate spatial data of CTS' power demand temporally.
+
+    Parameters
+    ----------
+    detailed : bool, default False
+        If True return 'per district and branch' else only 'per district'
+    use_nuts3code : bool, default False
+        If True use NUTS-3 codes as region identifiers.
+        state : str, default None
+    state : str, default None,
+        Specifies state. Must by one of the entries of bl_dict().values(),
+        ['SH', 'HH', 'NI', 'HB', 'NW', 'HE', 'RP', 'BW', 'BY', 'SL', 'BE',
+         'BB', 'MV', 'SN', 'ST', 'TH']
+    Returns
+    -------
+    pd.DataFrame
+    """
+    assert state in list(bl_dict().values()), ("'state' needs to be in ['SH',"
+                                               "'HH', 'NI', 'HB', 'NW', 'HE',"
+                                               "'RP', 'BW', 'BY', 'SL', 'BE',"
+                                               "'BB', 'MV', 'SN', 'ST', 'TH']")
+    assert isinstance(state, str), "'state' needs to be a string."
+
+    cfg = kwargs.get('cfg', get_config())
+    year = kwargs.get('year', cfg['base_year'])
+    if year not in range(2009, 2020):
+        raise ValueError("to use blp, `year` must be between 2009 and 2019.")
+    # Obtain yearly power consumption per WZ per LK
+    sv_yearly = (disagg_CTS_industry('power', 'CTS', year=year))
+    # splitting yearly demand in two groups. slp group are disaggregated with
+    # slp. blp group are disaggregated with blp (=profiles based on metered
+    # load data from the demandregio project)
+    blp_ghd = ([x for x in slp_wz_p().keys()
+                if x in blp_wz_list()])
+    slp_ghd = ([x for x in slp_wz_p().keys()
+                if x not in blp_wz_list()])
+    # define slp-group
+    ec_slp = (sv_yearly.reindex(index=slp_ghd).transpose()
+              .assign(BL=lambda x: [bl_dict().get(int(i[: -3]))
+                                    for i in x.index.astype(str)]))
+    # define blp-group
+    ec_blp = (sv_yearly.reindex(index=blp_ghd).transpose()
+              .assign(BL=lambda x: [bl_dict().get(int(i[: -3]))
+                                    for i in x.index.astype(str)]))
+    # calculate total sum for given state
+    total_sum = ((sv_yearly.transpose()
+                  .assign(BL=lambda x: [bl_dict().get(int(i[: -3]))
+                                        for i in x.index.astype(str)]))
+                 .loc[(sv_yearly.transpose()
+                       .assign(BL=lambda x: [bl_dict().get(int(i[: -3]))
+                                             for i in x.index.astype(str)]))
+                      ['BL'] == state]
+                 .sum(numeric_only=True)
+                 .sum())
+
+    # start with temporal disaggregation of slp group
+    # Create empty 15min-index'ed DataFrame for target year
+    idx = pd.date_range(start=str(year), end=str(year+1), freq='15T')[:-1]
+    DF = pd.DataFrame(index=idx)
+
+    logger.info('Working on state: {}.'.format(state))
+    sv_lk_wz = (ec_slp
+                .loc[lambda x: x['BL'] == state]
+                .drop(columns=['BL'])
+                .fillna(value=0)
+                .transpose()
+                .assign(SLP=lambda x: [slp_wz_p()[i] for i in x.index]))
+
+    logger.info('... creating state-specific load-profiles')
+    slp_bl = CTS_power_slp_generator(state, year=year)
+    # Plausibility check:
+    assert slp_bl.index.equals(idx), "The time-indizes are not aligned"
+    # Create 15min-index'ed DataFrames for current state
+    if detailed:
+        sv_lk_wz_ts = pd.DataFrame(index=idx)
+    else:
+        cols = sv_lk_wz.drop(columns=['SLP']).columns
+        sv_lk_ts = pd.DataFrame(index=idx, columns=cols).fillna(0.0)
+
+    logger.info('... assigning load-profiles to WZs')
+    for slp in sv_lk_wz['SLP'].unique():
+        sv_lk = (sv_lk_wz.loc[sv_lk_wz['SLP'] == slp]
+                         .drop(columns=['SLP']).stack().reset_index())
+        sv_dtl_df = sv_lk.groupby(by=['level_1'])[[0]].sum().transpose()
+        sv_lk = (sv_lk.assign(LK_WZ=lambda x: x.level_1.astype(str) + '_'
+                              + x.level_0.astype(str))
+                 .set_index('LK_WZ')
+                 .drop(['level_0', 'level_1'], axis=1)
+                 .loc[lambda x: x[0] >= 0]
+                 .transpose())
+
+        if detailed:  # Calculate load profile for each LK and WZ
+            lp_lk_wz = (pd.DataFrame(np.multiply(slp_bl[[slp]].values,
+                                                 sv_lk.values),
+                                     index=slp_bl.index,
+                                     columns=sv_lk.columns))
+        else:  # Calculate load profile for each LK
+            lp_lk = (pd.DataFrame(np.multiply(slp_bl[[slp]].values,
+                                              sv_dtl_df.values),
+                                  index=slp_bl.index,
+                                  columns=sv_dtl_df.columns))
+        # Merge intermediate results
+        if detailed:
+            sv_lk_wz_ts = (sv_lk_wz_ts.merge(lp_lk_wz, left_index=True,
+                                             right_index=True,
+                                             suffixes=(False, False)))
+        else:
+            sv_lk_ts += lp_lk
+
+    # Concatenate the state-wise results
+    if detailed:  # restore MultiIndex as integer tuples
+        sv_lk_wz_ts.columns =\
+            pd.MultiIndex.from_tuples([(int(x), int(y)) for x, y in
+                                       sv_lk_wz_ts.columns.str.split('_')])
+        DF = pd.concat([DF, sv_lk_wz_ts], axis=1)
+        DF.columns = pd.MultiIndex.from_tuples(DF.columns,
+                                               names=['LK', 'WZ'])
+    else:
+        DF = pd.concat([DF, sv_lk_ts], axis=1).dropna()
+
+    # start with temporal disaggregation of blp group
+    # prepare DataFrame
+    ec_blp = (ec_blp.loc[lambda x: x['BL'] == state]
+              .drop(columns=['BL'])
+              .fillna(value=0)
+              .transpose())
+    if detailed:
+        DF2 = pd.DataFrame()
+        logger.info('Start downloading BLP from Database now. This may take a'
+                    ' while depending on the connection. ca. 250MB per industr'
+                    'y will be downloaded and stored in your local folder ../d'
+                    'ata_in/cache.')
+
+        for region in ec_blp.columns:
+            region = str(region)
+            logger.info('Working on Region: '+str(region))
+            branch_model_64 = None
+            branch_model_41 = None
+            branch_model = None
+            for branch in blp_ghd:
+                if branch in [58, 59, 64, 65, 66, 67, 68, 69, 70, 71,
+                              73, 74, 75, 78, 95, 96, 99]:
+                    # these branches use the office blp, which is wz=64
+                    # logger.info('Working on WZ'+str(branch))
+                    if branch_model_64 is None:
+                        branch_model_64 = regional_branch_load_profiles(
+                            wz=64, region=region, year=year)
+                    demand_branch = (np.multiply(branch_model_64,
+                                                 ec_blp.loc[ec_blp.index
+                                                            == branch,
+                                                            int(region)]))
+                elif branch in [42, 43]:
+                    # these branches use the same blp, which is wz=41
+                    # logger.info('Working on WZ' + str(branch))
+                    if branch_model_41 is None:
+                        branch_model_41 = regional_branch_load_profiles(
+                            wz=41, region=region, year=year)
+                    demand_branch = (np.multiply(branch_model_41,
+                                                 ec_blp.loc[ec_blp.index
+                                                            == branch,
+                                                            int(region)]))
+                else:
+                    # rest of the branches uses individual blp
+                    # logger.info('Working on WZ' + str(branch))
+                    branch_model = regional_branch_load_profiles(wz=branch,
+                                                                 region=region,
+                                                                 year=year)
+                    demand_branch = (np.multiply(branch_model,
+                                                 ec_blp.loc[ec_blp
+                                                            .index == branch,
+                                                            int(region)]))
+                # create DF with branch and region in multicolumn
+                demand_branch_region = (demand_branch.T.assign(WZ=branch)
+                                        .set_index('WZ', append=True).T)
+                # concat demand_branch to DF2, DF2 has same index as DF
+                DF2 = pd.concat([DF2, demand_branch_region], axis=1)
+
+        DF2 = DF2/4000  # convert from kW to MWh
+        total_demand = DF.join(DF2)
+
+    else:
+        DF2 = (pd.DataFrame(0, index=pd.date_range(freq='15Min',
+                                                   start='01/01/'+str(year),
+                                                   periods=len(DF),
+                                                   ),
+                            columns=ec_blp.columns))
+        logger.info('Start downloading BLP from Database now. This may take a '
+                    'while depending on the connection. ca. 250MB per industry'
+                    ' will be downloaded and stored in your local folder ../da'
+                    'ta_in/cache.')
+        for region in ec_blp.columns:
+            branch_model_64 = None
+            branch_model_41 = None
+            branch_model = None
+            region = str(region)
+            logger.info('Working on Region: '+str(region))
+            for branch in blp_ghd:
+                if branch in [58, 59, 64, 65, 66, 67, 68, 69, 70, 71,
+                              73, 74, 75, 78, 95, 96, 99]:
+                    # these branches use the office blp, which is wz=64
+                    # logger.info('Working on WZ'+str(branch))
+                    if branch_model_64 is None:
+                        branch_model_64 = regional_branch_load_profiles(
+                            wz=64, region=region, year=year)
+                    demand_branch = (np.multiply(branch_model_64,
+                                                 ec_blp.loc[ec_blp.index
+                                                            == branch,
+                                                            int(region)]))
+                elif branch in [42, 43]:
+                    # these branches use the same blp, which is wz=41
+                    #logger.info('Working on WZ' + str(branch))
+                    if branch_model_41 is None:
+                        branch_model_41 = regional_branch_load_profiles(wz=41,
+                                                                region=region,
+                                                                year=year)
+                    demand_branch = (np.multiply(branch_model_41,
+                                                 ec_blp.loc[ec_blp.index
+                                                            == branch,
+                                                            int(region)]))
+                else:
+                    # rest of the branches uses individual blp
+                    #logger.info('Working on WZ' + str(branch))
+                    branch_model = regional_branch_load_profiles(wz=branch,
+                                                                 region=region,
+                                                                 year=year)
+                    demand_branch = (np.multiply(branch_model,
+                                                 ec_blp.loc[ec_blp.index
+                                                            == branch,
+                                                            int(region)]))
+                DF2 = DF2.add(demand_branch, axis=1, fill_value=0)
+        DF2 = DF2/4000  # convert from GW to MWh
+        total_demand = DF.add(DF2, axis=1, fill_value=0)
+
+    # Plausibility check:
+    msg = ('The sum of yearly consumptions (={:.3f}) and the sum of disaggrega'
+           'ted consumptions (={:.3f}) do not match! Please check algorithm!')
+    disagg_sum = total_demand.sum().sum()
+    assert np.isclose(total_sum, disagg_sum,
+                      rtol=1.e-3), msg.format(total_sum, disagg_sum)
+
+    if use_nuts3code:
+        total_demand = total_demand.rename(columns=dict_region_code(
+            level='lk', keys='ags_lk', values='natcode_nuts3'),
+            level=(0 if detailed else None))
+    return total_demand
+
+
 def disagg_temporal_power_CTS(detailed=False, use_nuts3code=False, **kwargs):
     """
     Disagreggate spatial data of CTS' power demand temporally.
@@ -837,7 +1307,7 @@ def disagg_temporal_power_CTS(detailed=False, use_nuts3code=False, **kwargs):
     cfg = kwargs.get('cfg', get_config())
     year = kwargs.get('year', cfg['base_year'])
     # Obtain yearly power consumption per WZ per LK
-    sv_yearly = (disagg_CTS_industry('power', 'CTS', year = year)
+    sv_yearly = (disagg_CTS_industry('power', 'CTS', year=year)
                  .transpose()
                  .assign(BL=lambda x: [bl_dict().get(int(i[: -3]))
                                        for i in x.index.astype(str)]))
@@ -906,6 +1376,120 @@ def disagg_temporal_power_CTS(detailed=False, use_nuts3code=False, **kwargs):
                                                    names=['LK', 'WZ'])
         else:
             DF = pd.concat([DF, sv_lk_ts], axis=1).dropna()
+
+    # Plausibility check:
+    msg = ('The sum of yearly consumptions (={:.3f}) and the sum of disaggrega'
+           'ted consumptions (={:.3f}) do not match! Please check algorithm!')
+    disagg_sum = DF.sum().sum()
+    assert np.isclose(total_sum, disagg_sum), msg.format(total_sum, disagg_sum)
+
+    if use_nuts3code:
+        DF = DF.rename(columns=dict_region_code(level='lk', keys='ags_lk',
+                                                values='natcode_nuts3'),
+                       level=(0 if detailed else None))
+    return DF
+
+
+def disagg_temporal_power_CTS_by_state(detailed=False, use_nuts3code=False,
+                                       state=None, **kwargs):
+    """
+    Disagreggate spatial data of CTS' power demand temporally.
+
+    Parameters
+    ----------
+    detailed : bool, default False
+        If True return 'per district and branch' else only 'per district'
+    use_nuts3code : bool, default False
+        If True use NUTS-3 codes as region identifiers.
+    state : str, default None
+        Specifies state. Must by one of the entries of bl_dict().values(),
+        ['SH', 'HH', 'NI', 'HB', 'NW', 'HE', 'RP', 'BW', 'BY', 'SL', 'BE',
+         'BB', 'MV', 'SN', 'ST', 'TH']
+    Returns
+    -------
+    pd.DataFrame
+    """
+    assert state in list(bl_dict().values()), ("'state' needs to be in ['SH',"
+                                               "'HH', 'NI', 'HB', 'NW', 'HE',"
+                                               "'RP', 'BW', 'BY', 'SL', 'BE',"
+                                               "'BB', 'MV', 'SN', 'ST', 'TH']")
+    assert isinstance(state, str), "'state' needs to be a string."
+
+    # state = [state] # define state as list
+    cfg = kwargs.get('cfg', get_config())
+    year = kwargs.get('year', cfg['base_year'])
+    # Obtain yearly power consumption per WZ per LK
+    sv_yearly = (disagg_CTS_industry('power', 'CTS', year=year)
+                 .transpose()
+                 .assign(BL=lambda x: [bl_dict().get(int(i[: -3]))
+                                       for i in x.index.astype(str)]))
+    # compute total sum for state for later plausibility check
+    total_sum = (sv_yearly.loc[sv_yearly['BL'] == state]
+                 .sum(numeric_only=True)
+                 .sum())
+
+    # Create empty 15min-index'ed DataFrame for target year
+    idx = pd.date_range(start=str(year), end=str(year+1), freq='15T')[:-1]
+    DF = pd.DataFrame(index=idx)
+
+    logger.info('Working on state: {}.'.format(state))
+    sv_lk_wz = (sv_yearly
+                .loc[lambda x: x['BL'] == state]
+                .drop(columns=['BL'])
+                .transpose()
+                .assign(SLP=lambda x: [slp_wz_p()[i] for i in x.index]))
+
+    logger.info('... creating state-specific load-profiles')
+    slp_bl = CTS_power_slp_generator(state, year=year)
+    # Plausibility check:
+    assert slp_bl.index.equals(idx), "The time-indizes are not aligned"
+    # Create 15min-index'ed DataFrames for current state
+    if detailed:
+        sv_lk_wz_ts = pd.DataFrame(index=idx)
+    else:
+        cols = sv_lk_wz.drop(columns=['SLP']).columns
+        sv_lk_ts = pd.DataFrame(index=idx, columns=cols).fillna(0.0)
+
+    logger.info('... assigning load-profiles to WZs')
+    for slp in sv_lk_wz['SLP'].unique():
+        sv_lk = (sv_lk_wz.loc[sv_lk_wz['SLP'] == slp]
+                         .drop(columns=['SLP']).stack().reset_index())
+        sv_dtl_df = sv_lk.groupby(by=['level_1'])[[0]].sum().transpose()
+        sv_lk = (sv_lk.assign(LK_WZ=lambda x: x.level_1.astype(str) + '_'
+                              + x.level_0.astype(str))
+                 .set_index('LK_WZ')
+                 .drop(['level_0', 'level_1'], axis=1)
+                 .loc[lambda x: x[0] >= 0]
+                 .transpose())
+
+        if detailed:  # Calculate load profile for each LK and WZ
+            lp_lk_wz = (pd.DataFrame(np.multiply(slp_bl[[slp]].values,
+                                                 sv_lk.values),
+                                     index=slp_bl.index,
+                                     columns=sv_lk.columns))
+        else:  # Calculate load profile for each LK
+            lp_lk = (pd.DataFrame(np.multiply(slp_bl[[slp]].values,
+                                              sv_dtl_df.values),
+                                  index=slp_bl.index,
+                                  columns=sv_dtl_df.columns))
+        # Merge intermediate results
+        if detailed:
+            sv_lk_wz_ts = (sv_lk_wz_ts.merge(lp_lk_wz, left_index=True,
+                                             right_index=True,
+                                             suffixes=(False, False)))
+        else:
+            sv_lk_ts += lp_lk
+
+    # Concatenate the results
+    if detailed:  # restore MultiIndex as integer tuples
+        sv_lk_wz_ts.columns =\
+            pd.MultiIndex.from_tuples([(int(x), int(y)) for x, y in
+                                       sv_lk_wz_ts.columns.str.split('_')])
+        DF = pd.concat([DF, sv_lk_wz_ts], axis=1)
+        DF.columns = pd.MultiIndex.from_tuples(DF.columns,
+                                               names=['LK', 'WZ'])
+    else:
+        DF = pd.concat([DF, sv_lk_ts], axis=1).dropna()
 
     # Plausibility check:
     msg = ('The sum of yearly consumptions (={:.3f}) and the sum of disaggrega'
@@ -1299,6 +1883,147 @@ def disagg_temporal_gas_CTS(detailed=False, use_nuts3code=False, **kwargs):
     return df
 
 
+def disagg_temporal_gas_CTS_by_state(detailed=False, use_nuts3code=False,
+                                     state=None, **kwargs):
+    """
+    Disagreggate spatial data of CTS' gas demand temporally.
+
+    detailed : bool, default False
+        If True return 'per district and branch' else only 'per district'
+    use_nuts3code : bool, default False
+        If True use NUTS-3 codes as region identifiers.
+    state : str, default None
+        Specifies state. Must by one of the entries of bl_dict().values(),
+        ['SH', 'HH', 'NI', 'HB', 'NW', 'HE', 'RP', 'BW', 'BY', 'SL', 'BE',
+         'BB', 'MV', 'SN', 'ST', 'TH']
+    Returns
+    -------
+    pd.DataFrame
+    """
+    assert state in list(bl_dict().values()), ("'state' needs to be in ['SH',"
+                                               "'HH', 'NI', 'HB', 'NW', 'HE',"
+                                               "'RP', 'BW', 'BY', 'SL', 'BE',"
+                                               "'BB', 'MV', 'SN', 'ST', 'TH']")
+    assert isinstance(state, str), "'state' needs to be a string."
+
+    cfg = kwargs.get('cfg', get_config())
+    year = kwargs.get('year', cfg['base_year'])  # get year
+    # check if gap year
+    if ((year % 4 == 0) & (year % 100 != 0) | (year % 4 == 0)
+            & (year % 100 == 0) & (year % 400 == 0)):
+        hours = 8784
+    else:
+        hours = 8760
+    temperatur_df = t_allo(year=year)  # get daily allocation temperature
+    # create DataFrame from temperature and use timestamp as index
+    df = pd.DataFrame(0, columns=temperatur_df.columns,
+                      index=pd.date_range((str(year) + '-01-01'),
+                                          periods=hours, freq='H'))
+    # for state in bl_dict().values():
+    logger.info('Working on state: {}.'.format(state))
+    tw_df, gv_lk = disagg_daily_gas_slp_cts(state, temperatur_df,
+                                            year=year)
+    gv_lk = (gv_lk.assign(BL=[bl_dict().get(int(x[:-3]))
+                              for x in gv_lk.index.astype(str)]))
+    t_allo_df = temperatur_df[gv_lk.loc[gv_lk['BL'] == state]
+                                   .index.astype(str)]
+    for col in t_allo_df.columns:
+        t_allo_df[col].values[t_allo_df[col].values < -15] = -15
+        t_allo_df[col].values[(t_allo_df[col].values > -15)
+                              & (t_allo_df[col].values < -10)] = -10
+        t_allo_df[col].values[(t_allo_df[col].values > -10)
+                              & (t_allo_df[col].values < -5)] = -5
+        t_allo_df[col].values[(t_allo_df[col].values > -5)
+                              & (t_allo_df[col].values < 0)] = 0
+        t_allo_df[col].values[(t_allo_df[col].values > 0)
+                              & (t_allo_df[col].values < 5)] = 5
+        t_allo_df[col].values[(t_allo_df[col].values > 5)
+                              & (t_allo_df[col].values < 10)] = 10
+        t_allo_df[col].values[(t_allo_df[col].values > 10)
+                              & (t_allo_df[col].values < 15)] = 15
+        t_allo_df[col].values[(t_allo_df[col].values > 15)
+                              & (t_allo_df[col].values < 20)] = 20
+        t_allo_df[col].values[(t_allo_df[col].values > 20)
+                              & (t_allo_df[col].values < 25)] = 25
+        t_allo_df[col].values[(t_allo_df[col].values > 25)] = 100
+        t_allo_df = t_allo_df.astype('int32')
+    f_wd = ['FW_BA', 'FW_BD', 'FW_BH', 'FW_GA', 'FW_GB', 'FW_HA', 'FW_KO',
+            'FW_MF', 'FW_MK', 'FW_PD', 'FW_WA', 'FW_SpaceHeating-MFH',
+            'FW_SpaceHeating-EFH',
+            'FW_Cooking_HotWater-HKO']
+    calender_df = (gas_slp_weekday_params(state, year=year)
+                   .drop(columns=f_wd))
+    temp_calender_df = (pd.concat([calender_df.reset_index(),
+                                   t_allo_df.reset_index()], axis=1))
+
+    if temp_calender_df.isnull().values.any():
+        raise KeyError('The chosen historical weather year and the chosen '
+                       'projected year have mismatching lengths.'
+                       'This could be due to gap years. Please change the '
+                       'historical year in hist_weather_year() in '
+                       'config.py to a year of matching length.')
+
+    temp_calender_df['Tagestyp'] = 'MO'
+    for typ in ['DI', 'MI', 'DO', 'FR', 'SA', 'SO']:
+        (temp_calender_df.loc[temp_calender_df[typ], 'Tagestyp']) = typ
+    list_lk = gv_lk.loc[gv_lk['BL'] == state].index.astype(str)
+    for lk in list_lk:
+        lk_df = pd.DataFrame(index=pd.date_range((str(year) + '-01-01'),
+                                                 periods=hours, freq='H'))
+        tw_df_lk = tw_df.loc[:, int(lk)]
+        tw_df_lk.index = pd.DatetimeIndex(tw_df_lk.index)
+        last_hour = tw_df_lk.copy()[-1:]
+        last_hour.index = last_hour.index + timedelta(1)
+        tw_df_lk = tw_df_lk.append(last_hour)
+        tw_df_lk = tw_df_lk.resample('H').pad()
+        tw_df_lk = tw_df_lk[:-1]
+
+        temp_cal = temp_calender_df.copy()
+        temp_cal = temp_cal[['Date', 'Tagestyp', lk]].set_index("Date")
+        last_hour = temp_cal.copy()[-1:]
+        last_hour.index = last_hour.index + timedelta(1)
+        temp_cal = temp_cal.append(last_hour)
+        temp_cal = temp_cal.resample('H').pad()
+        temp_cal = temp_cal[:-1]
+        temp_cal['Stunde'] = pd.DatetimeIndex(temp_cal.index).time
+        temp_cal = temp_cal.set_index(["Tagestyp", lk, 'Stunde'])
+
+        for slp in list(dict.fromkeys(slp_wz_g().values())):
+            f = ('Lastprofil_{}.xls'.format(slp))
+            slp_profil = pd.read_excel(data_in('temporal',
+                                               'Gas Load Profiles', f))
+            slp_profil = pd.DataFrame(slp_profil.set_index(['Tagestyp',
+                                        'Temperatur\nin °C\nkleiner']))
+            slp_profil.columns = pd.to_datetime(slp_profil.columns,
+                                                format='%H:%M:%S')
+            slp_profil.columns = pd.DatetimeIndex(slp_profil.columns).time
+            slp_profil = slp_profil.stack()
+            temp_cal['Prozent'] = [slp_profil[x] for x in temp_cal.index]
+            for wz in [k for k, v in slp_wz_g().items()
+                       if v.startswith(slp)]:
+                lk_df[str(lk) + '_' + str(wz)] = (tw_df_lk[wz].values
+                                                  * temp_cal['Prozent']
+                                                  .values/100)
+                df[str(lk) + '_' + str(wz)] = (tw_df_lk[wz].values
+                                               * temp_cal['Prozent']
+                                               .values/100)
+        df[str(lk)] = lk_df.sum(axis=1)
+    if detailed:
+        df = df.drop(columns=gv_lk.index.astype(str))
+        df.columns =\
+            pd.MultiIndex.from_tuples([(int(x), int(y)) for x, y in
+                                       df.columns.str.split('_')])
+    else:
+        df = df[gv_lk.index.astype(str)]
+        df = df[list_lk]
+
+    if use_nuts3code:
+        df = df.rename(columns=dict_region_code(level='lk', keys='ags_lk',
+                                                values='natcode_nuts3'),
+                       level=(0 if detailed else None))
+    return df
+
+
 def disagg_temporal_gas_households(use_nuts3code=False, how='top-down',
                                    **kwargs):
     """
@@ -1596,6 +2321,220 @@ def disagg_temporal_industry_blp(source='power', detailed=False,
     return total_demand
 
 
+def disagg_temporal_industry_blp_by_state(source='power', detailed=False,
+                                          use_nuts3code=False, low=0.4,
+                                          no_self_gen=False, state=None,
+                                          **kwargs):
+    """
+    Disagreggate spatial data of industrie's power or gas demand temporally.
+
+    Parameters
+    ----------
+    source : str
+        Must be either 'power' or 'gas'
+    detailed : bool, default False
+        choose depth of dissolution
+        True: demand per district and detailed
+        False: demand per district
+    use_nuts3code : bool, default False
+        If True use NUTS-3 codes as region identifiers.
+    low : float
+        throughput for data.shift_load_profile_generator(low)
+    no_self_gen : bool, default False
+        throughput for spatial.disagg_CTS_industry(no_self_gen=False)
+        If True: returns specific power and gas consumption without self
+                 generation, resulting energy consumption will be lower
+    state : str, default None
+        Specifies state. Must by one of the entries of bl_dict().values(),
+        ['SH', 'HH', 'NI', 'HB', 'NW', 'HE', 'RP', 'BW', 'BY', 'SL', 'BE',
+         'BB', 'MV', 'SN', 'ST', 'TH']
+    Returns
+    -------
+    pd.DataFrame or Tuple
+    """
+    assert state in list(bl_dict().values()), ("'state' needs to be in ['SH',"
+                                               "'HH', 'NI', 'HB', 'NW', 'HE',"
+                                               "'RP', 'BW', 'BY', 'SL', 'BE',"
+                                               "'BB', 'MV', 'SN', 'ST', 'TH']")
+    assert isinstance(state, str), "'state' needs to be a string."
+
+    cfg = kwargs.get('cfg', get_config())
+    year = kwargs.get('year', cfg['base_year'])
+    if year not in range(2009, 2020):
+        raise ValueError("to use blp, `year` must be between 2009 and 2019.")
+    if source != 'power':
+        raise ValueError("blp can only used for electricity consumption."
+                         'change source to "power".')
+    # Obtain yearly power consumption per WZ per LK
+    ec_yearly = (disagg_CTS_industry('power', 'industry', year=year,
+                                     no_self_gen=no_self_gen))
+    # splitting yearly demand in two groups. slp group are disaggregated with
+    # shift load profiles. blp group are disaggregated with blp
+    # (=profiles based on metered load data from the demandregio project)
+    blp_i = ([x for x in shift_profile_industry().keys()
+              if x in blp_wz_list()])
+    slp_i = ([x for x in shift_profile_industry().keys()
+              if x not in blp_wz_list()])
+    # energy consumption 'slp'
+    ec_slp = (ec_yearly.loc[slp_i].transpose()
+              .assign(BL=lambda x: [bl_dict().get(int(i[: -3]))
+                                    for i in x.index.astype(str)]))
+    # define blp-group
+    ec_blp = (ec_yearly.reindex(index=blp_i).transpose()
+              .assign(BL=lambda x: [bl_dict().get(int(i[: -3]))
+                                    for i in x.index.astype(str)]))
+
+    # calculate total sum for given state
+    total_sum = ((ec_yearly.transpose()
+                  .assign(BL=lambda x: [bl_dict().get(int(i[: -3]))
+                                        for i in x.index.astype(str)]))
+                 .loc[(ec_yearly.transpose()
+                       .assign(BL=lambda x: [bl_dict().get(int(i[: -3]))
+                                             for i in x.index.astype(str)]))
+                      ['BL'] == state]
+                 .sum(numeric_only=True)
+                 .sum())
+
+    # start with temporal disaggregation of slp group
+    # Create empty 15min-index'ed DataFrame for target year
+    idx = pd.date_range(start=str(year), end=str(year+1), freq='15T')[:-1]
+    DF = pd.DataFrame(index=idx)
+    logger.info('Working on state: {}.'.format(state))
+    # create DataFrame with columns containing load_profile names
+    sv_lk_wz = (ec_slp
+                .loc[lambda x: x['BL'] == state]
+                .drop(columns=['BL'])
+                .fillna(value=0)
+                .transpose()
+                .assign(SP=lambda x:
+                        [shift_profile_industry()[i] for i in x.index]))
+    logger.info('... creating state-specific load-profiles')
+    sp_bl = shift_load_profile_generator(state, low, year=year)
+    # Plausibility check:
+    assert sp_bl.index.equals(idx), "The time-indizes are not aligned"
+    # Create 15min-index'ed DataFrames for current state
+    if detailed:
+        sv_lk_wz_ts = pd.DataFrame(index=idx)
+
+    else:
+        cols = sv_lk_wz.drop(columns=['SP']).columns
+        sv_lk_ts = pd.DataFrame(index=idx, columns=cols).fillna(0.0)
+
+    logger.info('... assigning load-profiles to WZs')
+    for sp in sv_lk_wz['SP'].unique():
+        sv_lk = (sv_lk_wz.loc[sv_lk_wz['SP'] == sp]
+                         .drop(columns=['SP']).stack().reset_index())
+        sv_dtl_df = sv_lk.groupby(by=['level_1'])[[0]].sum().transpose()
+        sv_lk = (sv_lk.assign(LK_WZ=lambda x: x.level_1.astype(str) + '_'
+                              + x.level_0.astype(str))
+                 .set_index('LK_WZ')
+                 .drop(['level_0', 'level_1'], axis=1)
+                 .loc[lambda x: x[0] >= 0]
+                 .transpose())
+
+        if detailed:  # Calculate load profile for each LK and WZ
+            lp_lk_wz = (pd.DataFrame(np.multiply(sp_bl[[sp]].values,
+                                                 sv_lk.values),
+                                     index=sp_bl.index,
+                                     columns=sv_lk.columns))
+        else:  # Calculate load profile for each LK
+            lp_lk = (pd.DataFrame(np.multiply(sp_bl[[sp]].values,
+                                              sv_dtl_df.values),
+                                  index=sp_bl.index,
+                                  columns=sv_dtl_df.columns))
+        # Merge intermediate results
+        if detailed:
+            sv_lk_wz_ts = (sv_lk_wz_ts.merge(lp_lk_wz, left_index=True,
+                                             right_index=True,
+                                             suffixes=(False, False)))
+        else:
+            sv_lk_ts += lp_lk
+
+    # Concatenate the state-wise results
+    # restore MultiIndex as integer tuples
+    if detailed:
+        sv_lk_wz_ts.columns =\
+            pd.MultiIndex.from_tuples([(int(x), int(y)) for x, y in
+                                       sv_lk_wz_ts.columns.str.split('_')])
+        DF = pd.concat([DF, sv_lk_wz_ts], axis=1)
+        DF.columns = pd.MultiIndex.from_tuples(DF.columns,
+                                               names=['LK', 'WZ'])
+    else:
+        DF = pd.concat([DF, sv_lk_ts], axis=1).dropna()
+
+    # start with temporal disaggregation of blp group
+    # prepare DataFrame and filter for state
+    ec_blp = (ec_blp.loc[lambda x: x['BL'] == state]
+              .drop(columns=['BL'])
+              .fillna(value=0)
+              .transpose())
+    if detailed:
+        DF2 = pd.DataFrame()
+        logger.info('Start downloading BLP from Database now. This may take a'
+                    ' while depending on the connection. ca. 250MB per industr'
+                    'y will be downloaded and stored in your local folder ../d'
+                    'ata_in/cache.')
+        for region in ec_blp.columns:
+            region = str(region)
+            logger.info('Working on Region: '+str(region))
+            for branch in blp_i:
+                # logger.info('Working on WZ'+str(branch))
+                branch_model = regional_branch_load_profiles(wz=branch,
+                                                             region=region,
+                                                             year=year)
+                demand_branch = (np.multiply(branch_model,
+                                             (ec_blp.loc[ec_blp
+                                                         .index == branch,
+                                                         int(region)])))
+                DF2 = pd.concat([DF2, (demand_branch.T
+                                       .assign(WZ=branch)
+                                       .set_index('WZ', append=True)
+                                       .T)], axis=1)
+
+        DF2 = DF2/4000  # convert from kW to MWh
+        total_demand = DF.join(DF2)
+
+    else:
+        DF2 = (pd.DataFrame(0, index=pd.date_range(freq='15Min',
+                                                   start='01/01/'+str(year),
+                                                   periods=len(DF)),
+                            columns=ec_blp.columns))
+        logger.info('Start downloading BLP from Database now. This may take a '
+                    'while depending on the connection. ca. 250MB per industry'
+                    ' will be downloaded and stored in your local folder ../da'
+                    'ta_in/cache.')
+        for region in ec_blp.columns:
+            region = str(region)
+            logger.info('Working on Region: '+str(region))
+            for branch in blp_i:
+                # logger.info('Working on WZ'+str(branch))
+                branch_model = regional_branch_load_profiles(wz=branch,
+                                                             region=region,
+                                                             year=year)
+                demand_branch = (np.multiply(branch_model,
+                                             (ec_blp
+                                              .loc[ec_blp
+                                                   .index == branch,
+                                                   int(region)])))
+                DF2 = DF2.add(demand_branch, axis=1, fill_value=0)
+
+        DF2 = DF2/4000  # convert from GW to MWh
+        total_demand = DF.add(DF2, axis=1, fill_value=0)
+
+    # Plausibility check:
+    msg = ('The sum of yearly consumptions (={:.3f}) and the sum of disaggrega'
+           'ted consumptions (={:.3f}) do not match! Please check algorithm!')
+    disagg_sum = total_demand.sum().sum()
+    assert np.isclose(total_sum, disagg_sum,
+                      rtol=1.e-3), msg.format(total_sum, disagg_sum)
+
+    if use_nuts3code:
+        total_demand = total_demand.rename(columns=dict_region_code(
+            level='lk', keys='ags_lk', values='natcode_nuts3'),
+            level=(0 if detailed else None))
+    return total_demand
+
+
 def disagg_temporal_industry(source, detailed=False, use_nuts3code=False,
                              low=0.4, no_self_gen=False, **kwargs):
     """
@@ -1694,6 +2633,132 @@ def disagg_temporal_industry(source, detailed=False, use_nuts3code=False,
                                                    names=['LK', 'WZ'])
         else:
             DF = pd.concat([DF, sv_lk_ts], axis=1).dropna()
+
+    # Plausibility check:
+    msg = ('The sum of yearly consumptions (={:.3f}) and the sum of disaggrega'
+           'ted consumptions (={:.3f}) do not match! Please check algorithm!')
+    disagg_sum = DF.sum().sum()
+    assert np.isclose(total_sum, disagg_sum), msg.format(total_sum, disagg_sum)
+
+    if use_nuts3code:
+        DF = DF.rename(columns=dict_region_code(level='lk', keys='ags_lk',
+                                                values='natcode_nuts3'),
+                       level=(0 if detailed else None))
+    return DF
+
+
+def disagg_temporal_industry_by_state(source, detailed=False,
+                                      use_nuts3code=False, low=0.4,
+                                      no_self_gen=False, state=None, **kwargs):
+    """
+    Disagreggate spatial data of industrie's power or gas demand temporally.
+
+    Parameters
+    ----------
+    source : str
+        Must be either 'power' or 'gas'
+    detailed : bool, default False
+        choose depth of dissolution
+        True: demand per district and detailed
+        False: demand per district
+    use_nuts3code : bool, default False
+        If True use NUTS-3 codes as region identifiers.
+    low : float
+        throughput for data.shift_load_profile_generator(low)
+    no_self_gen : bool, default False
+        throughput for spatial.disagg_CTS_industry(no_self_gen=False)
+        If True: returns specific power and gas consumption without self
+                 generation, resulting energy consumption will be lower
+    state : str, default None
+        Specifies state. Must by one of the entries of bl_dict().values(),
+        ['SH', 'HH', 'NI', 'HB', 'NW', 'HE', 'RP', 'BW', 'BY', 'SL', 'BE',
+         'BB', 'MV', 'SN', 'ST', 'TH']
+    Returns
+    -------
+    pd.DataFrame or Tuple
+    """
+    assert state in list(bl_dict().values()), ("'state' needs to be in ['SH',"
+                                               "'HH', 'NI', 'HB', 'NW', 'HE',"
+                                               "'RP', 'BW', 'BY', 'SL', 'BE',"
+                                               "'BB', 'MV', 'SN', 'ST', 'TH']")
+    assert isinstance(state, str), "'state' needs to be a string."
+
+    cfg = kwargs.get('cfg', get_config())
+    year = kwargs.get('year', cfg['base_year'])
+    # Obtain yearly power consumption per WZ per LK
+    ec_yearly = (disagg_CTS_industry(source, 'industry',
+                                     no_self_gen=no_self_gen, year=year)
+                 .transpose()
+                 .assign(BL=lambda x: [bl_dict().get(int(i[: -3]))
+                                       for i in x.index.astype(str)]))
+    # total_sum = ec_yearly.drop('BL', axis=1).sum().sum()  # for later check
+    total_sum = (ec_yearly.loc[ec_yearly['BL'] == state]
+                 .sum(numeric_only=True)
+                 .sum())
+    # Create empty 15min-index'ed DataFrame for target year
+    idx = pd.date_range(start=str(year), end=str(year+1), freq='15T')[:-1]
+    DF = pd.DataFrame(index=idx)
+
+    logger.info('Working on state: {}.'.format(state))
+    # create DataFrame with columns containing load_profile names
+    sv_lk_wz = (ec_yearly
+                .loc[lambda x: x['BL'] == state]
+                .drop(columns=['BL'])
+                .fillna(value=0)
+                .transpose()
+                .assign(SP=lambda x:
+                        [shift_profile_industry()[i] for i in x.index]))
+    logger.info('... creating state-specific load-profiles')
+    sp_bl = shift_load_profile_generator(state, low, year=year)
+    # Plausibility check:
+    assert sp_bl.index.equals(idx), "The time-indizes are not aligned"
+    # Create 15min-index'ed DataFrames for current state
+    if detailed:
+        sv_lk_wz_ts = pd.DataFrame(index=idx)
+    else:
+        cols = sv_lk_wz.drop(columns=['SP']).columns
+        sv_lk_ts = pd.DataFrame(index=idx, columns=cols).fillna(0.0)
+
+    logger.info('... assigning load-profiles to WZs')
+    for sp in sv_lk_wz['SP'].unique():
+        sv_lk = (sv_lk_wz.loc[sv_lk_wz['SP'] == sp]
+                         .drop(columns=['SP']).stack().reset_index())
+        sv_dtl_df = sv_lk.groupby(by=['level_1'])[[0]].sum().transpose()
+        sv_lk = (sv_lk.assign(LK_WZ=lambda x: x.level_1.astype(str) + '_'
+                              + x.level_0.astype(str))
+                 .set_index('LK_WZ')
+                 .drop(['level_0', 'level_1'], axis=1)
+                 .loc[lambda x: x[0] >= 0]
+                 .transpose())
+
+        if detailed:  # Calculate load profile for each LK and WZ
+            lp_lk_wz = (pd.DataFrame(np.multiply(sp_bl[[sp]].values,
+                                                 sv_lk.values),
+                                     index=sp_bl.index,
+                                     columns=sv_lk.columns))
+        else:  # Calculate load profile for each LK
+            lp_lk = (pd.DataFrame(np.multiply(sp_bl[[sp]].values,
+                                              sv_dtl_df.values),
+                                  index=sp_bl.index,
+                                  columns=sv_dtl_df.columns))
+        # Merge intermediate results
+        if detailed:
+            sv_lk_wz_ts = (sv_lk_wz_ts.merge(lp_lk_wz, left_index=True,
+                                             right_index=True,
+                                             suffixes=(False, False)))
+        else:
+            sv_lk_ts += lp_lk
+
+    # Concatenate the state-wise results
+    if detailed:  # restore MultiIndex as integer tuples
+        sv_lk_wz_ts.columns =\
+            pd.MultiIndex.from_tuples([(int(x), int(y)) for x, y in
+                                       sv_lk_wz_ts.columns.str.split('_')])
+        DF = pd.concat([DF, sv_lk_wz_ts], axis=1)
+        DF.columns = pd.MultiIndex.from_tuples(DF.columns,
+                                               names=['LK', 'WZ'])
+    else:
+        DF = pd.concat([DF, sv_lk_ts], axis=1).dropna()
 
     # Plausibility check:
     msg = ('The sum of yearly consumptions (={:.3f}) and the sum of disaggrega'
