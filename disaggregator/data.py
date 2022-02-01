@@ -257,6 +257,37 @@ def h_value(slp, districts, temperatur_df):
     return temp_df
 
 
+def h_value_water(slp, districts, temperatur_df): # added 
+    """
+    Returns h-values depending on allocation temperature  for every
+    district.
+
+    Parameter
+    -------
+    slp : str
+        Must be one of ['BA', 'BD', 'BH', 'GA', 'GB', 'HA',
+                        'KO', 'MF', 'MK', 'PD', 'WA']
+    districts : list of district keys in state e.g. ['11000'] for Berlin
+
+    Returns
+    -------
+    pd.DataFrame
+    """
+    temp_df = temperatur_df.copy()[[x for x in districts]]
+    # Below 13 °C, the water heating demand is not defined and assumed to stay
+    # constant
+    temp_df.clip(13, inplace=True)
+    par = gas_load_profile_parameters_dict()
+    D = par['D'][slp]
+    mW = par['mW'][slp]
+    bW = par['bW'][slp]
+    for landkreis in districts:
+        te = temp_df[landkreis].values
+        for i in range(len(te)):
+            temp_df[landkreis][i] = (D + mW * te[i] + bW)
+    return temp_df
+
+
 def generate_specific_consumption_per_branch(**kwargs):
     """
     Returns specific power and gas consumption per branch. Also returns total
