@@ -79,7 +79,7 @@ def elc_consumption_HH(by_HH_size=False, **kwargs):
     else:
         if source == 'local':
             df = float(read_local(data_in('dimensionless',
-                                           cfg[key]['filename']),
+                                          cfg[key]['filename']),
                                   year=year)
                        .reset_index(drop=True)
                        .loc[0, 'value'])
@@ -111,7 +111,7 @@ def heat_consumption_HH(by='households', **kwargs):
         col = {'households': 'PersonsInHousehold',
                'buildings': 'BuildingType'}[by]
         df = (pd.read_csv(data_in('dimensionless',
-                                   cfg['heat_consumption_HH']['filename']))
+                                  cfg['heat_consumption_HH']['filename']))
                 .pivot_table(index='Application', columns=col, values='Value'))
     elif source == 'database':
         raise NotImplementedError('Not here yet!')
@@ -257,7 +257,7 @@ def h_value(slp, districts, temperatur_df):
     return temp_df
 
 
-def h_value_water(slp, districts, temperatur_df): # added 
+def h_value_water(slp, districts, temperatur_df):
     """
     Returns h-values depending on allocation temperature  for every
     district.
@@ -334,7 +334,6 @@ def generate_specific_consumption_per_branch(**kwargs):
     # replace the missing values
     x = vb_wz.isnull().values.any()
     year2 = year1+1
-
     while (x):
         logger.info('The following data was missing for the requested year: '
                     + str(year1))
@@ -360,74 +359,20 @@ def generate_specific_consumption_per_branch(**kwargs):
                         + str(year2))
     # continue with procedure here: create DF for electricity and
     # gas consumption
-    vb_wz['value'] = vb_wz['value'] * 1000 / 3.6
-    sv_wz_real = (vb_wz.loc[vb_wz['ET'] == 18][['WZ', 'value']]
-                       .groupby(by='WZ')[['value']].sum()
-                       .rename(columns={'value': 'SV WZ [MWh]'}))
-    gv_wz_real = (vb_wz.loc[vb_wz['ET'] == 12][['WZ', 'value']]
-                       .groupby(by='WZ')[['value']].sum()
-                       .rename(columns={'value': 'GV WZ [MWh]'}))
-    # manual correction of false data from database, data take from
-    # "Tabelle 2 - Umweltökonomische Gesamtrechnung 2019"
-    if(year == 2015):
-        sv_wz_real.loc['21'] = 1779722
-        sv_wz_real.loc['69-75'] = 15243888.88888889
+    sv_wz_real, gv_wz_real = reshape_energy_consumption_df(vb_wz, year=year)
 
-        gv_wz_real.loc['1'] = 2323170.37
-        gv_wz_real.loc['21'] = 4942035.13
-        gv_wz_real.loc['26'] = 2177598.10
-        gv_wz_real.loc['31-32'] = 981097.90
-        gv_wz_real.loc['43'] = 3208491.39
-        gv_wz_real.loc['55-56'] = 5114970.43
-        gv_wz_real.loc['85'] = 13023398.31
-
-    elif(year == 2016):
-        sv_wz_real.loc['21'] = 1759722
-        gv_wz_real.loc['20'] = 88759166.67
+    # project energy demand per wz to given year using activity drivers from
+    # input files. For industry gross value added (gva) per branch is used, for
+    # CTS energy reference area per branch is used, which is derived from
+    # projected number of employees
+    if year > year1:  # if requested year is after year of dataset
+        sv_wz_real, gv_wz_real = (project_energy_consumption(
+            sv_wz_real, gv_wz_real, year_projected=year, year_dataset=year1))
 
     # get number of employees (bze) from database
-    bze_je_lk_wz = pd.DataFrame(employees_per_branch(year=year1))
-    bze_lk_wz = (pd.DataFrame(0.0, index=bze_je_lk_wz.columns,
-                              columns=wz_dict().values()))
-    # arrange employees DataFrame accordingly to energy consumption statistics
-    for i in [1, 2, 3, 5, 6]:
-        bze_lk_wz[str(i)] = bze_je_lk_wz.transpose()[i]
-    for i in [7, 8, 9]:
-        bze_lk_wz['7-9'] = bze_lk_wz['7-9'] + bze_je_lk_wz.transpose()[i]
-    for i in [10, 11, 12]:
-        bze_lk_wz['10-12'] = bze_lk_wz['10-12'] + bze_je_lk_wz.transpose()[i]
-    for i in [13, 14, 15]:
-        bze_lk_wz['13-15'] = bze_lk_wz['13-15'] + bze_je_lk_wz.transpose()[i]
-    for i in [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]:
-        bze_lk_wz[str(i)] = bze_je_lk_wz.transpose()[i]
-    bze_lk_wz['31-32'] = (bze_je_lk_wz.transpose()[31]
-                          + bze_je_lk_wz.transpose()[32])
-    for i in [33, 35, 36, 37]:
-        bze_lk_wz[str(i)] = bze_je_lk_wz.transpose()[i]
-    bze_lk_wz['38-39'] = (bze_je_lk_wz.transpose()[38]
-                          + bze_je_lk_wz.transpose()[39])
-    bze_lk_wz['41-42'] = (bze_je_lk_wz.transpose()[41]
-                          + bze_je_lk_wz.transpose()[42])
-    for i in [43, 45, 46, 47, 49, 50, 51, 52, 53]:
-        bze_lk_wz[str(i)] = bze_je_lk_wz.transpose()[i]
-    bze_lk_wz['55-56'] = (bze_je_lk_wz.transpose()[55]
-                          + bze_je_lk_wz.transpose()[56])
-    for i in [58, 59, 60, 61, 62, 63]:
-        bze_lk_wz['58-63'] = bze_lk_wz['58-63'] + bze_je_lk_wz.transpose()[i]
-    for i in [64, 65, 66]:
-        bze_lk_wz['64-66'] = bze_lk_wz['64-66'] + bze_je_lk_wz.transpose()[i]
-    bze_lk_wz[str(68)] = bze_je_lk_wz.transpose()[68]
-    for i in [69, 70, 71, 72, 73, 74, 75]:
-        bze_lk_wz['69-75'] = bze_lk_wz['69-75'] + bze_je_lk_wz.transpose()[i]
-    for i in [77, 78, 79, 80, 81, 82]:
-        bze_lk_wz['77-82'] = bze_lk_wz['77-82'] + bze_je_lk_wz.transpose()[i]
-    for i in [84, 85]:
-        bze_lk_wz[str(i)] = bze_je_lk_wz.transpose()[i]
-    bze_lk_wz['86-88'] = (bze_je_lk_wz.transpose()[86]
-                          + bze_je_lk_wz.transpose()[87]
-                          + bze_je_lk_wz.transpose()[88])
-    for i in [90, 91, 92, 93, 94, 95, 96, 97, 98, 99]:
-        bze_lk_wz['90-99'] = bze_lk_wz['90-99'] + bze_je_lk_wz.transpose()[i]
+    bze_je_lk_wz = pd.DataFrame(employees_per_branch(year=year))
+    bze_lk_wz = reshape_employees_df(bze_je_lk_wz)
+
     # calculate specific consumption
     spez_gv = (pd.DataFrame(bze_lk_wz.transpose().drop_duplicates()
                             .sum(axis=1))
@@ -463,7 +408,7 @@ def generate_specific_consumption_per_branch(**kwargs):
     # use factor from sheet to decompose energy consumption
     f = ('Decomposition Factors Industrial Energy Demand.xlsx')
     df_decom = pd.read_excel(data_in('dimensionless', f),
-                               sheet_name='Tabelle1')
+                             sheet_name='Tabelle1')
     df_decom.set_index('WZ', inplace=True)
     df_decom = spez_gv.merge(df_decom, how='left',
                              left_index=True, right_index=True)
@@ -561,7 +506,7 @@ def generate_specific_consumption_per_branch_and_district(iterations_power=8,
         vb_LK = database_get('spatial', table_id=15, year=2003)
         x = False
         print('Regional energy consumption of 2003 was used for calibration \n'
-               'of industrial energy consumption.')
+              'of industrial energy consumption.')
     while(x):
         try:
             vb_LK = database_get('spatial', table_id=15, year=year1)
@@ -624,14 +569,12 @@ def generate_specific_consumption_per_branch_and_district(iterations_power=8,
                                                 .loc[[21, 26, 30, 31, 32]]
                                                 .sum())
     sv_LK_real.loc[:, 'Verbrauch e-int WZ'] = (sv_LK_real['Verbrauch in MWh']
-                                               - sv_LK_real
-                                                   ['Verbrauch e-arme WZ'])
+                                               - sv_LK_real['Verbrauch e-arme WZ'])
     gv_LK_real.loc[:, 'Verbrauch e-arme WZ'] = (gv_lk_wz
                                                 .loc[[26, 27, 28, 31, 32, 33]]
                                                 .sum())
     gv_LK_real.loc[:, 'Verbrauch e-int WZ'] = (gv_LK_real['Verbrauch in MWh']
-                                               - gv_LK_real
-                                                   ['Verbrauch e-arme WZ'])
+                                               - gv_LK_real['Verbrauch e-arme WZ'])
     # get specific demand per WZ and district
     spez_sv_e_int = spez_sv_lk.loc[sv_ind_branches]
     spez_gv_e_int = spez_gv_lk.loc[gv_ind_branches]
@@ -672,9 +615,9 @@ def generate_specific_consumption_per_branch_and_district(iterations_power=8,
                         spez_sv_angepasst[spez_sv_angepasst < 10] = 10
                         spez_sv_angepasst = (spez_sv_angepasst
                                              * sv_LK['Verbrauch e-int WZ']
-                                               .sum()
+                                             .sum()
                                              / sv_LK['SV Modell e-int [MWh]']
-                                               .sum())
+                                             .sum())
                         sv_lk_wz_e_int = bze_sv_e_int * spez_sv_angepasst
                     else:
                         y = False
@@ -782,9 +725,9 @@ def generate_specific_consumption_per_branch_and_district(iterations_power=8,
                         spez_gv_angepasst[spez_gv_angepasst < 10] = 10
                         spez_gv_angepasst = (spez_gv_angepasst
                                              * gv_LK['Verbrauch e-int WZ']
-                                               .sum()
+                                             .sum()
                                              / gv_LK['GV Modell e-int [MWh]']
-                                               .sum())
+                                             .sum())
                         gv_lk_wz_e_int = bze_gv_e_int * spez_gv_angepasst
                     else:
                         y = False
@@ -1468,6 +1411,20 @@ def efficiency_enhancement(source, **kwargs):
         return df
 
 
+def get_current_efficiency_level():  # TBD!
+    """
+    Returns current efficiency level.
+
+    Returns
+    -------
+    None.
+
+    """
+    # Idee: DataFrame für power, DataFrame für gas mit columns = applications,
+    # rows = year 
+    return 0.9
+
+
 def get_WZ_for_sector(sector):
     """
     Return a list of WZ codes corresponding to gHD or industrial sector
@@ -1541,7 +1498,7 @@ def employees_per_branch(region_code='ags_lk', **kwargs):
                 .loc[lambda x: x.WZ > 0])
         df = (pd.pivot_table(df, values='value', index='WZ', fill_value=0,
                              columns='region_code', dropna=False))
-    elif year in range(2018, 2036):
+    elif year in range(2018, 2031):
         if scenario == 'Basis':
             df = database_get('spatial', table_id=27, year=year)
         elif scenario == 'Digital':
@@ -1555,9 +1512,32 @@ def employees_per_branch(region_code='ags_lk', **kwargs):
                         WZ=[x[0] for x in df['internal_id']])
                 .pivot_table(values='value', index='WZ', fill_value=0,
                              columns='region_code', dropna=False))
-    else:
-        raise ValueError("`year` must be between 2000 and 2035")
+    else:  # take employees from latest available year, which is 2030
+        if scenario == 'Basis':
+            df = database_get('spatial', table_id=27, year=2030)
+        elif scenario == 'Digital':
+            df = database_get('spatial', table_id=28, year=2030)
+        else:
+            raise ValueError("`scenario` must be in ['Basis', 'Digital']")
 
+        df = (df.assign(region_code=lambda x:
+                        x.id_region.map(dict_region_code(keys='id_region',
+                                                         values=region_code)),
+                        WZ=[x[0] for x in df['internal_id']])
+                .pivot_table(values='value', index='WZ', fill_value=0,
+                             columns='region_code', dropna=False))
+        # project employees using table from data_in
+        # read employee projection per branch and year for entire Germany
+        emp_industry, emp_cts = read_employee_projection()
+        emp_total = emp_industry.join(emp_cts)
+        # normalize projection using last available year from database (2030)
+        emp_total = emp_total.apply(lambda x: x/x.loc[2030])
+        # scale employees based on values of 2030
+        df = (df.T.multiply(emp_total.loc[year])).T
+        logger.warning('A year higher than 2030 was chosen. Last available '
+                       'employee data from database was used from 2030 and'
+                       'projected based on employee data from "activity_'
+                       'drivers" in data_in.')
     return df
 
 
@@ -2171,6 +2151,243 @@ def reshape_spatiotemporal(freq=None, key=None, **kwargs):
 
 
 # %% Utility functions
+
+
+def project_energy_consumption(df_elec_con, df_gas_con, year_projected,
+                               year_dataset):
+    """
+    Projects consumption data from publications to future year using different
+    demand driver per sector. for industry use projected gross value added per
+    branch and for CTS use projected consumption area per branch. drivers are
+    imported from data_in folder.
+
+    Parameters
+    -------
+    df_elec_con, df_gas_con : pd.Series or DataFrame
+        electricity and gas demand from database
+    year_projected : int
+        target year for projection
+    year_dataset : int
+        actual year of most recent dataset, as obtained from database
+
+    Returns
+    -------
+    pd.DataFrames with projected electricity and gas demand
+
+    """
+    df_driver_industry, df_driver_cts = read_activity_drivers()
+    df_driver_total = reshape_activity_drivers(df_driver_industry,
+                                               df_driver_cts,
+                                               columns=df_elec_con.index)
+    # normalize Dataframe based on year of the last available dataset
+    df_driver_norm = df_driver_total.apply(lambda x: x/x.loc[year_dataset])
+    # multiply electricity and gas consumption with projected driver
+    df_elec_con_projected = (df_elec_con.T
+                             .multiply(df_driver_norm.loc[year_projected]).T)
+    df_gas_con_projected = (df_gas_con.T
+                            .multiply(df_driver_norm.loc[year_projected]).T)
+    # WZ 35 is dropped
+    return df_elec_con_projected.dropna(), df_gas_con_projected.dropna()
+
+
+def reshape_activity_drivers(df_driver_industry, df_driver_cts, columns):
+    """
+    Reshapes activity driver data to match partly aggregated consumption data
+    from publications.
+
+    Parameters
+    -------
+    df_driver_industry, df_driver_cts : pd.DataFrames
+        Activity drivers as read from model input. years in index, branches in
+        columns
+    columns : np.array or index
+        Defined aggregation of branches from publication.
+
+    Returns
+    -------
+    pd.DataFrame
+
+    """
+    df_driver_total = df_driver_industry.join(df_driver_cts).fillna(0)
+    # create new DF with aggregated drivers
+    new_df = pd.DataFrame(index=df_driver_total.index, columns=columns, data=0)
+    for i in [1, 2, 3, 5, 6, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+              28, 29, 30, 33, 36, 37, 43, 45, 46, 47, 49, 50, 51, 52, 53, 68,
+              84, 85]:
+        new_df[str(i)] = df_driver_total[i]
+    for i in [7, 8, 9]:
+        new_df['7-9'] = new_df['7-9'] + df_driver_total[i]
+    for i in [10, 11, 12]:
+        new_df['10-12'] = new_df['10-12'] + df_driver_total[i]
+    for i in [13, 14, 15]:
+        new_df['13-15'] = new_df['13-15'] + df_driver_total[i]
+    new_df['31-32'] = (df_driver_total[31] + df_driver_total[32])
+    new_df['38-39'] = (df_driver_total[38] + df_driver_total[39])
+    new_df['41-42'] = (df_driver_total[41] + df_driver_total[42])
+    new_df['55-56'] = (df_driver_total[55] + df_driver_total[56])
+    for i in [58, 59, 60, 61, 62, 63]:
+        new_df['58-63'] = new_df['58-63'] + df_driver_total[i]
+    for i in [64, 65, 66]:
+        new_df['64-66'] = new_df['64-66'] + df_driver_total[i]
+    for i in [69, 70, 71, 72, 73, 74, 75]:
+        new_df['69-75'] = new_df['69-75'] + df_driver_total[i]
+    for i in [77, 78, 79, 80, 81, 82]:
+        new_df['77-82'] = new_df['77-82'] + df_driver_total[i]
+    for i in [86, 87, 88]:
+        new_df['86-88'] = new_df['86-88'] + df_driver_total[i]
+    for i in [90, 91, 92, 93, 94, 95, 96, 97, 98, 99]:
+        new_df['90-99'] = new_df['90-99'] + df_driver_total[i]
+
+    return new_df.drop('35', axis=1)
+
+
+def read_activity_drivers():
+    """
+    Reads activity drives from input folder
+
+    Returns
+    -------
+    pd.DataFrame for industry drivers, pd.DataFrame for CTS drivers
+
+    """
+    # reading and preapring the table
+    PATH = data_in("temporal", "Activity_drivers.xlsx")
+    df_driver_industry = pd.read_excel(PATH,
+                                       sheet_name=("drivers_industry_gva"),
+                                       skiprows=1).set_index('year')
+    df_driver_cts = pd.read_excel(PATH, sheet_name=("drivers_cts_area"),
+                                  skiprows=1).set_index('year')
+
+    return df_driver_industry, df_driver_cts
+
+
+def read_employee_projection():
+    """
+    Reads activity drives from input folder
+
+    Returns
+    -------
+    pd.DataFrame for industry drivers, pd.DataFrame for CTS drivers
+
+    """
+    # reading and preapring the table
+    PATH = data_in("temporal", "Activity_drivers.xlsx")
+    df_driver_industry = pd.read_excel(PATH,
+                                       sheet_name=("drivers_industry_emp"),
+                                       skiprows=1).set_index('year')
+    df_driver_cts = pd.read_excel(PATH, sheet_name=("drivers_cts_emp"),
+                                  skiprows=1).set_index('year')
+
+    return df_driver_industry, df_driver_cts
+
+
+def reshape_energy_consumption_df(ec_df, year):
+    """
+    Reshapes DataFrame obtained from database and and returns one DF with
+    electricity consumption per branch and on for gas consumption per branch.
+
+    Parameter
+    -------
+    ec_df : pd.Dataframe
+        with energy consumption from database.
+    year : int
+        specifies year in case for particular corrections for years 2015
+        or 2016
+    Returns
+    -------
+    sv_wz_real : pd.Series
+        contains electricity consumption per branch
+    gv_wz_real : pd.Series
+        contains gas consumption per branch
+
+    """
+
+    ec_df['value'] = ec_df['value'] * 1000 / 3.6
+    sv_wz_real = (ec_df.loc[ec_df['ET'] == 18][['WZ', 'value']]
+                       .groupby(by='WZ')[['value']].sum()
+                       .rename(columns={'value': 'SV WZ [MWh]'}))
+    gv_wz_real = (ec_df.loc[ec_df['ET'] == 12][['WZ', 'value']]
+                       .groupby(by='WZ')[['value']].sum()
+                       .rename(columns={'value': 'GV WZ [MWh]'}))
+    # manual correction of false data from database, data take from
+    # "Tabelle 2 - Umweltökonomische Gesamtrechnung 2019"
+    if(year == 2015):
+        sv_wz_real.loc['21'] = 1779722
+        sv_wz_real.loc['69-75'] = 15243888.88888889
+
+        gv_wz_real.loc['1'] = 2323170.37
+        gv_wz_real.loc['21'] = 4942035.13
+        gv_wz_real.loc['26'] = 2177598.10
+        gv_wz_real.loc['31-32'] = 981097.90
+        gv_wz_real.loc['43'] = 3208491.39
+        gv_wz_real.loc['55-56'] = 5114970.43
+        gv_wz_real.loc['85'] = 13023398.31
+
+    elif(year == 2016):
+        sv_wz_real.loc['21'] = 1759722
+        gv_wz_real.loc['20'] = 88759166.67
+
+    return sv_wz_real, gv_wz_real
+
+
+def reshape_employees_df(df_emp):
+    """
+    Reshapes DataFrame to be comparable with aggregated energy demand for
+    mulitple branches from energy statistics.
+
+    Input
+    -------
+    df_emp : pd.DataFrame() containing number of emplyees per branch.
+
+    Returns
+    -------
+    pd. DataFrame
+
+    """
+
+    bze_lk_wz = (pd.DataFrame(0.0, index=df_emp.columns,
+                              columns=wz_dict().values()))
+    # arrange employees DataFrame accordingly to energy consumption statistics
+    for i in [1, 2, 3, 5, 6]:
+        bze_lk_wz[str(i)] = df_emp.transpose()[i]
+    for i in [7, 8, 9]:
+        bze_lk_wz['7-9'] = bze_lk_wz['7-9'] + df_emp.transpose()[i]
+    for i in [10, 11, 12]:
+        bze_lk_wz['10-12'] = bze_lk_wz['10-12'] + df_emp.transpose()[i]
+    for i in [13, 14, 15]:
+        bze_lk_wz['13-15'] = bze_lk_wz['13-15'] + df_emp.transpose()[i]
+    for i in [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]:
+        bze_lk_wz[str(i)] = df_emp.transpose()[i]
+    bze_lk_wz['31-32'] = (df_emp.transpose()[31]
+                          + df_emp.transpose()[32])
+    for i in [33, 35, 36, 37]:
+        bze_lk_wz[str(i)] = df_emp.transpose()[i]
+    bze_lk_wz['38-39'] = (df_emp.transpose()[38]
+                          + df_emp.transpose()[39])
+    bze_lk_wz['41-42'] = (df_emp.transpose()[41]
+                          + df_emp.transpose()[42])
+    for i in [43, 45, 46, 47, 49, 50, 51, 52, 53]:
+        bze_lk_wz[str(i)] = df_emp.transpose()[i]
+    bze_lk_wz['55-56'] = (df_emp.transpose()[55]
+                          + df_emp.transpose()[56])
+    for i in [58, 59, 60, 61, 62, 63]:
+        bze_lk_wz['58-63'] = bze_lk_wz['58-63'] + df_emp.transpose()[i]
+    for i in [64, 65, 66]:
+        bze_lk_wz['64-66'] = bze_lk_wz['64-66'] + df_emp.transpose()[i]
+    bze_lk_wz[str(68)] = df_emp.transpose()[68]
+    for i in [69, 70, 71, 72, 73, 74, 75]:
+        bze_lk_wz['69-75'] = bze_lk_wz['69-75'] + df_emp.transpose()[i]
+    for i in [77, 78, 79, 80, 81, 82]:
+        bze_lk_wz['77-82'] = bze_lk_wz['77-82'] + df_emp.transpose()[i]
+    for i in [84, 85]:
+        bze_lk_wz[str(i)] = df_emp.transpose()[i]
+    bze_lk_wz['86-88'] = (df_emp.transpose()[86]
+                          + df_emp.transpose()[87]
+                          + df_emp.transpose()[88])
+    for i in [90, 91, 92, 93, 94, 95, 96, 97, 98, 99]:
+        bze_lk_wz['90-99'] = bze_lk_wz['90-99'] + df_emp.transpose()[i]
+
+    return bze_lk_wz
 
 
 def database_description(dimension='spatial', short=True, only_active=True,
