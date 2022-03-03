@@ -7,25 +7,849 @@ Created on Tue Jan 25 17:39:43 2022
 # %% Imports
 from .spatial import disagg_applications
 from .config import (data_in, data_out, get_config, dict_region_code,
-                     hist_weather_year, bl_dict)
+                     hist_weather_year, bl_dict, shift_profile_industry)
 from .data import (database_shapes, ambient_T, CTS_power_slp_generator,
-                   households_per_size, t_allo)
-from .temporal import (disagg_temporal_gas_CTS_water, disagg_temporal_gas_CTS, 
-                       disagg_temporal_gas_households,
+                   households_per_size, t_allo, shift_load_profile_generator,
+                   get_current_efficiency_level, gas_slp_weekday_params,
+                   h_value, h_value_water)
+from .temporal import (disagg_temporal_gas_CTS_water, disagg_temporal_gas_CTS,
                        disagg_temporal_power_CTS,
                        disagg_temporal_gas_CTS_by_state,
-                       disagg_temporal_gas_CTS_water_by_state)
+                       disagg_temporal_gas_CTS_water_by_state,
+                       disagg_temporal_industry_blp, disagg_temporal_industry,
+                       disagg_temporal_power_CTS_blp,
+                       disagg_temporal_industry_blp_by_state,
+                       disagg_temporal_industry_by_state,
+                       disagg_temporal_power_CTS_blp_by_state,
+                       disagg_temporal_power_CTS_by_state)
 
 import pandas as pd
-# import numpy as np
+import numpy as np
 # import matplotlib.pyplot as plt
 import os
 from netCDF4 import Dataset, num2date
-from datetime import timedelta
+from datetime import timedelta, date
 import logging
 logger = logging.getLogger(__name__)
 
 # %% Functions
+
+
+def sector_fuel_switch_fom_gas(sector, switch_to, **kwargs):
+    """
+    Determines yearly gas demand per branch and NUTS-3 for heat applications
+    that will be replaced by a different fuel in the future.
+    Fuel is specified by parameter 'switch_to'.
+
+    Parameters
+    ----------
+    sector : str
+        must be one of ['CTS', 'industry']
+    switch_to: str
+        must be one of ['power', 'hydrogen']
+
+    Returns
+    -------
+    pd.DataFrame
+
+    """
+    assert switch_to in ['power', 'hydrogen'], ("'switch_to' needs to be in "
+                                                "['power', 'hydrogen'].")
+    # get base year
+    cfg = kwargs.get('cfg', get_config())
+    year = kwargs.get('year', cfg['base_year'])
+    # read input data, which contains reduction levels of gas usage for heat
+    # applications
+    fuel_switch = read_fuel_switch_share(sector, switch_to)
+    # linear projection to the given year
+    fuel_switch_projected = projection_fuel_switch_share(fuel_switch,
+                                                         target_year=year)
+    # get yearly gas demand per application
+    df_app = disagg_applications(source='gas', sector=sector,
+                                 disagg_ph=True, year=year)
+
+    # create new DF for gas demand which will be replaced by different fuel
+    df_gas_switch = pd.DataFrame(index=df_app.index,
+                                 columns=df_app.columns,
+                                 data=0)
+    # for each branch and each application multiply gas demand by share of
+    # fuel switch
+    for branch in df_app.columns.unique(level=0):
+        for app in fuel_switch_projected.columns.unique():
+            df_gas_switch[branch, app] = (df_app[branch, app]
+                                          * (fuel_switch_projected
+                                             .loc[branch][app]))
+    # drop all columns with only zeros
+    df_gas_switch = df_gas_switch.loc[:, (df_gas_switch != 0).any(axis=0)]
+
+    return df_gas_switch
+
+
+def disagg_temporal_industry_fuel_switch(df_gas_switch,
+                                         state=None, **kwargs):
+    """
+    Temporally disaggregates industry gas demand, which will be switched by
+    state.
+
+    Parameters
+    -------
+    df_gas_switch : pd.DataFrame
+        Gas demand by branch, application and NUTS-3 region which will be
+        replaced.
+    state : str, default None
+        Specifies state. Must by one of the entries of bl_dict().values(),
+        ['SH', 'HH', 'NI', 'HB', 'NW', 'HE', 'RP', 'BW', 'BY', 'SL', 'BE',
+         'BB', 'MV', 'SN', 'ST', 'TH']
+    Returns
+    -------
+    pd.DataFrame() : timestamp as index, multicolumns with nuts-3, branch and
+        applications. used shift load profiles for industry for temporal
+        disaggregation of df_gas_switch.
+
+    """
+    assert state in list(bl_dict().values()), ("'state' needs to be in "
+                                               "['SH', 'HH', 'NI', 'HB', "
+                                               "'NW', 'HE', 'RP', 'BW', "
+                                               "'BY', 'SL', 'BE', 'BB', "
+                                               "'MV', 'SN', 'ST', 'TH']")
+    assert isinstance(state, str), "'state' needs to be a string."
+    # check if a year was specified
+    cfg = kwargs.get('cfg', get_config())
+    year = kwargs.get("year", cfg["base_year"])
+    # troughput values for the helper function, used for industrial disagg
+    low = kwargs.get("low", 0.4)
+
+    # make a dict with nuts3 as keys (lk) and nuts1 as values (bl)
+    nuts3_list = df_gas_switch.index
+    nuts1_list = [bl_dict().get(int(i[: -3]))
+                  for i in df_gas_switch.index.astype(str)]
+    nuts3_nuts1_dict = dict(zip(nuts3_list, nuts1_list))
+
+    # creat multicolumn from df_gas_switch columns and index
+    # count how many different applications there are
+    amount_application = len(df_gas_switch.columns.unique(level=1))
+    # count how many different wz (industrial/commercial branches) there are
+    amount_wz = len(df_gas_switch.columns.unique(level=0))
+    # count how many different regions there are
+    regions = [k for k, v in nuts3_nuts1_dict.items() if v == state]
+    amount_regions = len(regions)
+
+    # create multicolumn for result DataFrame()
+    multi_lk = [elem for elem in regions
+                for _ in range(amount_application * amount_wz)]
+    multi_wz = [elem for elem in df_gas_switch.columns.unique(level=0)
+                for _ in range(amount_application)] * amount_regions
+    multi_app = (list(df_gas_switch.columns.unique(level=1))
+                 * amount_regions
+                 * amount_wz)
+    tuples = list(zip(*[multi_lk, multi_wz, multi_app]))
+    multicolumn = pd.MultiIndex.from_tuples(tuples, names=["LK", "WZ",
+                                                           "Anwendungen"])
+    # create index for year in 15 min timesteps
+    idx = pd.date_range(start=str(year), end=str(year+1), freq='15T')[:-1]
+    # create new df for temporal disaggregated heat demand
+    new_df = pd.DataFrame(index=idx, columns=multicolumn)
+
+    # get shift load profiles for given state
+    sp_bl = shift_load_profile_generator(state, low, year=year)
+    
+    # get normalized timeseries for temperature dependent gas demand for
+    # industrial indoor heating, approximated with cts indor heat with gas SLP
+    # 'KO'
+    if 'Raumwärme' in df_gas_switch.columns.unique(level=1):
+        heat_norm, gas_total, gas_tempinde_norm = create_heat_norm_industry(
+            state=state, slp='KO', year=year)
+        # upsample heat_norm to quarter hours and interpolate, then normalize
+        heat_norm = (heat_norm.resample('15T').asfreq()
+                     .interpolate(method='linear',
+                                  limit_direction='forward', axis=0))
+        # extend DataFrame by 3 more periods
+        extension = pd.DataFrame(index=pd.date_range(heat_norm.index[-1:]
+                                                     .values[0], periods=4,
+                                                     freq='15T')[-3:],
+                                 columns=heat_norm.columns)
+        heat_norm = heat_norm.append(extension).fillna(method='ffill')
+        # normalize
+        heat_norm = heat_norm.divide(heat_norm.sum(), axis=1)
+        assert heat_norm.index.equals(idx), "The time-indizes are not aligned"
+
+    # start assigning disaggregated demands to columns of new_df by multiplying
+    # shift_load_profiles with yearly demands per region, branch and app
+    assert sp_bl.index.equals(idx), "The time-indizes are not aligned"
+    # nuts-3 (lk) per state
+    for lk in new_df.columns.get_level_values(0).unique():
+        for branch in (df_gas_switch.loc[lk]
+                       .index.get_level_values(0).unique()):
+            for app in df_gas_switch.loc[lk][branch].index:
+                if app == 'Raumwärme':
+                    new_df[lk, branch, app] = (
+                        (df_gas_switch.loc[lk][branch, app]) * (heat_norm[lk]))
+                else:
+                    new_df[lk, branch, app] = ((df_gas_switch
+                                                .loc[lk][branch, app])
+                                               * sp_bl[shift_profile_industry()
+                                                       [branch]])
+    # drop all columns with only zeros
+    new_df = new_df.loc[:, (new_df != 0).any(axis=0)]
+    # drop all columns that have only nan values
+    new_df = new_df.dropna(axis=1, how='all')
+
+    return new_df
+
+
+def disagg_temporal_cts_fuel_switch(df_gas_switch, state=None, **kwargs):
+    """
+    Temporally disaggregates CTS gas demand, which will be switched, by state.
+
+    Parameters
+    -------
+    df_gas_switch : pd.DataFrame
+        Gas demand by branch, application and NUTS-3 region which will be
+        replaced.
+    state : str, default None
+        Specifies state. Must by one of the entries of bl_dict().values(),
+        ['SH', 'HH', 'NI', 'HB', 'NW', 'HE', 'RP', 'BW', 'BY', 'SL', 'BE',
+         'BB', 'MV', 'SN', 'ST', 'TH']
+    Returns
+    -------
+    pd.DataFrame() : timestamp as index, multicolumns with nuts-3, branch and
+        applications. temperature dependent and independent profiles from gas
+        SLP for temporal disaggregation of df_gas_switch.
+
+    Returns
+    -------
+    None.
+
+    """
+    assert state in list(bl_dict().values()), ("'state' needs to be in "
+                                               "['SH', 'HH', 'NI', 'HB', "
+                                               "'NW', 'HE', 'RP', 'BW', "
+                                               "'BY', 'SL', 'BE', 'BB', "
+                                               "'MV', 'SN', 'ST', 'TH']")
+    assert isinstance(state, str), "'state' needs to be a string."
+    # check if a year was specified
+    cfg = kwargs.get('cfg', get_config())
+    year = kwargs.get("year", cfg["base_year"])
+
+    # make a dict with nuts3 as keys (lk) and nuts1 as values (bl)
+    nuts3_list = df_gas_switch.index
+    nuts1_list = [bl_dict().get(int(i[: -3]))
+                  for i in df_gas_switch.index.astype(str)]
+    nuts3_nuts1_dict = dict(zip(nuts3_list, nuts1_list))
+
+    # creat multicolumn from df_gas_switch columns and index
+    # count how many different applications there are
+    amount_application = len(df_gas_switch.columns.unique(level=1))
+    # count how many different wz (industrial/commercial branches) there are
+    amount_wz = len(df_gas_switch.columns.unique(level=0))
+    # count how many different regions there are
+    regions = [k for k, v in nuts3_nuts1_dict.items() if v == state]
+    amount_regions = len(regions)
+
+    # create multicolumn for result DataFrame()
+    multi_lk = [elem for elem in regions
+                for _ in range(amount_application * amount_wz)]
+    multi_wz = [elem for elem in df_gas_switch.columns.unique(level=0)
+                for _ in range(amount_application)] * amount_regions
+    multi_app = (list(df_gas_switch.columns.unique(level=1))
+                 * amount_regions
+                 * amount_wz)
+    tuples = list(zip(*[multi_lk, multi_wz, multi_app]))
+    multicolumn = pd.MultiIndex.from_tuples(tuples, names=["LK", "WZ",
+                                                           "Anwendungen"])
+    # create index for year in 15 min timesteps
+    idx = pd.date_range(start=str(year), end=str(year+1), freq='15T')[:-1]
+    # create new df for temporal disaggregated heat demand
+    new_df = pd.DataFrame(index=idx, columns=multicolumn)
+
+    # get normalized timeseries for temperature dependent and temperature
+    # independent gas demand in CTS
+    heat_norm, gas_total, gas_tempinde_norm = create_heat_norm_cts(
+        detailed=True, state=state, year=year)
+    # upsample heat_norm to quarter hours and
+    # interpolate, then normalize
+    heat_norm = (heat_norm.resample('15T').asfreq()
+                 .interpolate(method='linear',
+                              limit_direction='forward', axis=0))
+    # extend DataFrame by 3 more periods
+    extension = pd.DataFrame(index=pd.date_range(heat_norm.index[-1:]
+                                                 .values[0], periods=4,
+                                                 freq='15T')[-3:],
+                             columns=heat_norm.columns)
+    heat_norm = heat_norm.append(extension).fillna(method='ffill')
+    # normalize
+    heat_norm = heat_norm.divide(heat_norm.sum(), axis=1)
+    # upsample gas_tempinde_norm to quarter hours
+    gas_tempinde_norm = (gas_tempinde_norm.resample('15T').asfreq()
+                         .interpolate(method='linear',
+                                      limit_direction='forward', axis=0))
+    # extend DataFrame by 3 more periods
+    extension = pd.DataFrame(index=pd.date_range(gas_tempinde_norm.index[-1:]
+                                                 .values[0], periods=4,
+                                                 freq='15T')[-3:],
+                             columns=gas_tempinde_norm.columns)
+    gas_tempinde_norm = (gas_tempinde_norm.append(extension)
+                         .fillna(method='ffill'))
+    # normalize
+    gas_tempinde_norm = gas_tempinde_norm.divide(gas_tempinde_norm.sum(),
+                                                 axis=1)
+
+    # create temp disaggregated gas demands per nuts-3, branch and app
+    for lk in new_df.columns.get_level_values(0).unique():
+        for branch in (df_gas_switch.loc[lk]
+                       .index.get_level_values(0).unique()):
+            for app in (df_gas_switch.loc[lk][branch].index):
+                if app == 'Raumwärme':
+                    new_df[lk, branch, app] = (
+                        (df_gas_switch.loc[lk][branch, app])
+                        * (heat_norm[lk, branch]))
+                else:
+                    new_df[lk, branch, app] = (
+                        (df_gas_switch.loc[lk][branch, app])
+                        * (gas_tempinde_norm[lk, branch]))
+
+    # drop all columns that have only nan values
+    new_df.dropna(axis=1, how='all', inplace=True)
+
+    return new_df
+
+
+def temporal_cts_elec_load_from_fuel_switch(df_temp_gas_switch, p_ground=0.36,
+                                            p_air=0.58, p_water=0.06):
+    """
+    Converts timeseries of gas demand per NUTS-3 and branch and application to
+        electric consumption timeseries. Uses COP timeseries for heat
+        applications. uses efficiency for mechanical energy.
+    Parameters
+    -------
+    df_temp_gas_switch : pd.DataFrame()
+        timestamp as index, multicolumns with nuts-3, branch and applications.
+        contains temporally disaggregated gas demand for fuel switch
+    p_ground, p_air, p_water : float, default 0.36, 0.58, 0.06
+        percentage of ground/air/water heat pumps sum must be 1
+    Returns
+    -------
+    None.
+
+    """
+    if p_ground + p_air + p_water != 1:
+        raise ValueError("sum of percentage of ground/air/water heat pumps"
+                         " must be 1")
+    # get year from dataframe index
+    year = df_temp_gas_switch.index[0].year
+    # create new DataFrame for results
+    df_temp_elec_from_gas_switch = pd.DataFrame(index=df_temp_gas_switch.index,
+                                                columns=(df_temp_gas_switch
+                                                         .columns),
+                                                data=0)
+    # create index slicer for data selection
+    col = pd.IndexSlice
+    # select heat applications which will be converted using cop series for
+    # different temperatur levels. use efficiency to convert from gas to heat.
+    # select indoor heating
+    df_heating_switch = (df_temp_gas_switch.loc[:, col[:, :, ['Raumwärme']]]
+                         * get_current_efficiency_level())
+    # get the COP timeseries for indoor heating --> T=40°C
+    air_floor_cop, ground_floor_cop, water_floor_cop = cop_ts(sink_t=40,
+                                                              source='ambient',
+                                                              year=year)
+    # assert that the years of COP TS and year of df_temp are aligned
+    assert (air_floor_cop.index.year.unique() ==
+            df_heating_switch.index.year.unique()),\
+        ("The year of COP ts does not match the year of the heat demand ts")
+    df_temp_indoor_heating = (p_ground * (df_heating_switch
+                                          .div(ground_floor_cop, level=0)
+                                          .fillna(method='ffill'))
+                              + p_air * (df_heating_switch
+                                         .div(air_floor_cop, level=0)
+                                         .fillna(method='ffill'))
+                              + p_water * (df_heating_switch
+                                           .div(water_floor_cop, level=0)
+                                           .fillna(method='ffill')))
+    # select process heating
+    df_heating_switch = (df_temp_gas_switch.loc[:, col[:, :, ['Prozesswärme']]]
+                         * get_current_efficiency_level())
+    # get the COP timeseries for process heating --> T=70°C
+    air_floor_cop, ground_floor_cop, water_floor_cop = cop_ts(sink_t=70,
+                                                              source='ambient',
+                                                              year=year)
+    df_temp_process_heat = (p_ground * (df_heating_switch.div(ground_floor_cop,
+                                                              level=0)
+                                        .fillna(method='ffill'))
+                            + p_air * (df_heating_switch.div(air_floor_cop,
+                                                             level=0)
+                                       .fillna(method='ffill'))
+                            + p_water * (df_heating_switch
+                                         .div(water_floor_cop, level=0)
+                                         .fillna(method='ffill')))
+    # select warm water heating
+    df_heating_switch = (df_temp_gas_switch.loc[:, col[:, :, ['Warmwasser']]]
+                         * get_current_efficiency_level())
+    # get the COP timeseries for warm water  --> T=55°C
+    air_floor_cop, ground_floor_cop, water_floor_cop = cop_ts(sink_t=55,
+                                                              source='ambient',
+                                                              year=year)
+    df_temp_warm_water = (p_ground * (df_heating_switch.div(ground_floor_cop,
+                                                            level=0)
+                                      .fillna(method='ffill'))
+                          + p_air * (df_heating_switch.div(air_floor_cop,
+                                                           level=0)
+                                     .fillna(method='ffill'))
+                          + p_water * (df_heating_switch
+                                       .div(water_floor_cop, level=0)
+                                       .fillna(method='ffill')))
+    # select Mechanical Energy
+    df_mechanical_switch = ((df_temp_gas_switch
+                            .loc[:, col[:, :, ['Mechanische \nEnergie']]])
+                            * 0.4 / 0.85)  # TBD HACK! Update get_current_efficiency_level()
+    # add all dataframes together for electric demand per nuts3, branch and app
+    df_temp_elec_from_gas_switch = (df_temp_elec_from_gas_switch
+                                    .add(df_temp_indoor_heating, fill_value=0)
+                                    .add(df_temp_process_heat, fill_value=0)
+                                    .add(df_temp_warm_water, fill_value=0)
+                                    .add(df_mechanical_switch, fill_value=0))
+    return df_temp_elec_from_gas_switch
+
+
+def temporal_industry_elec_load_from_fuel_switch(df_temp_gas_switch,
+                                                 p_ground=0.36, p_air=0.58,
+                                                 p_water=0.06):
+    """
+    Calculates electric consumption temporally disaggregated gas consumption,
+    which will be switched to power.
+
+    Parameters
+    -------
+    df_temp_gas_switch : pd.DataFrame()
+        timestamp as index, multicolumns with nuts-3, branch and applications.
+        contains temporally disaggregated gas demand for fuel switch
+    p_ground, p_air, p_water : float, default 0.36, 0.58, 0.06
+        percentage of ground/air/water heat pumps sum must be 1
+
+    Returns
+    -------
+    pd.DataFrame : 3 DataFrames with electricity consumption
+    None.
+
+    """
+    if p_ground + p_air + p_water != 1:
+        raise ValueError("sum of percentage of ground/air/water heat pumps"
+                         " must be 1")
+    # get year from dataframe index
+    year = df_temp_gas_switch.index[0].year
+    
+    # create new DataFrame for results
+    df_temp_elec_from_gas_switch = pd.DataFrame(index=df_temp_gas_switch.index,
+                                                columns=(df_temp_gas_switch
+                                                         .columns),
+                                                data=0)
+    # create index slicer for data selection
+    col = pd.IndexSlice
+
+    # 1: get the COP timeseries for indoor heating --> T=40°C
+    air_floor_cop, ground_floor_cop, water_floor_cop = cop_ts(sink_t=40,
+                                                              source='ambient',
+                                                              year=year)
+    # assert that the years of COP TS and year of df_temp are aligned
+    assert (air_floor_cop.index.year.unique() ==
+            df_temp_gas_switch.index.year.unique()),\
+        ("The year of COP ts does not match the year of the heat demand ts")
+
+    # select indoor heating demand to be converted to electric demand with cop.
+    # use efficiency to convert from gas to heat.
+    df_hp_heat = (df_temp_gas_switch
+                  .loc[:, col[:, :, ['Raumwärme']]]
+                  * get_current_efficiency_level())
+    df_temp_hp_heating = (p_ground * (df_hp_heat.div(ground_floor_cop, level=0)
+                                      .fillna(method='ffill'))
+                          + p_air * (df_hp_heat
+                                     .div(air_floor_cop, level=0)
+                                     .fillna(method='ffill'))
+                          + p_water * (df_hp_heat
+                                       .div(water_floor_cop, level=0)
+                                       .fillna(method='ffill')))
+
+    # 2: get the COP timeseries for low temperature process heat --> T=80°C
+    air_floor_cop, ground_floor_cop, water_floor_cop = cop_ts(sink_t=80,
+                                                              source='ambient',
+                                                              year=year)
+    # select low tmeperature heat to be converted to electric demand with cop
+    df_hp_heat = (df_temp_gas_switch
+                  .loc[:, col[:, :, ['Prozesswärme <100°C']]]
+                  * get_current_efficiency_level())
+    df_temp_hp_low_heat = (p_ground * (df_hp_heat
+                                       .div(ground_floor_cop, level=0)
+                                       .fillna(method='ffill'))
+                           + p_air * (df_hp_heat
+                                      .div(air_floor_cop, level=0)
+                                      .fillna(method='ffill'))
+                           + p_water * (df_hp_heat
+                                        .div(water_floor_cop, level=0)
+                                        .fillna(method='ffill')))
+
+    # 3: get the COP timeseries for high temperature process heat
+    # --> T_sink=120°C, T_source=50°C delta_T=70°C
+    high_temp_hp_cop = cop_ts(source='waste heat', delta_t=70, year=year)
+    # select low tmeperature heat to be converted to electric demand with cop
+    df_hp_heat = (df_temp_gas_switch
+                  .loc[:, col[:, :, ['Prozesswärme 100°C-200°C']]]
+                  * get_current_efficiency_level())
+    df_temp_hp_medium_heat = (df_hp_heat.div(high_temp_hp_cop, level=0)
+                              .fillna(method='ffill'))
+    # 4 get the COP timeseries for warm water  --> T=55°C
+    air_floor_cop, ground_floor_cop, water_floor_cop = cop_ts(sink_t=55,
+                                                              source='ambient',
+                                                              year=year)
+    # select warm water heat to be converted to electric demand with cop
+    df_hp_heat = (df_temp_gas_switch
+                  .loc[:, col[:, :, ['Warmwasser']]]
+                  * get_current_efficiency_level())
+    df_temp_warm_water = (p_ground * (df_hp_heat.div(ground_floor_cop,
+                                                            level=0)
+                                      .fillna(method='ffill'))
+                          + p_air * (df_hp_heat.div(air_floor_cop,
+                                                           level=0)
+                                     .fillna(method='ffill'))
+                          + p_water * (df_hp_heat
+                                       .div(water_floor_cop, level=0)
+                                       .fillna(method='ffill')))
+    # 5 select Mechanical Energy
+    df_mechanical_switch = ((df_temp_gas_switch
+                            .loc[:, col[:, :, ['Mechanische \nEnergie']]])
+                            * 0.4 / 0.85)  # TBD HACK! Update get_current_efficiency_level()
+    
+    # add all dataframes together for electric demand per nuts3, branch and app
+    df_temp_elec_from_gas_switch = (df_temp_elec_from_gas_switch
+                                    .add(df_temp_hp_heating, fill_value=0)
+                                    .add(df_temp_hp_low_heat, fill_value=0)
+                                    .add(df_temp_hp_medium_heat, fill_value=0)
+                                    .add(df_temp_warm_water, fill_value=0)
+                                    .add(df_mechanical_switch, fill_value=0))
+
+    return df_temp_elec_from_gas_switch
+
+
+def calculate_consumption_after_switch(df_old, df_switch, source):
+    """
+    
+
+    Returns
+    -------
+    None.
+
+    """
+    if source == 'power':
+        df_total = df_old.add(df_switch)
+    else:
+        df_total = df_old.sub(df_switch)
+        
+    return df_total
+
+
+def disagg_temporal_applications_hp(source, sector, detailed=False, state=None,
+                                    use_nuts3code=False, disagg_ph=False,
+                                    use_blp=False, use_hp=True, **kwargs):
+    """
+    Perform dissagregation based on applications of the final energy usage.
+    Uses temperature dependent timeseries for heat pumps for electricity
+    consumption of indoor heating in CTS sector.
+
+    Parameters
+    ----------
+    source : str
+        must be one of ['power', 'gas']
+    sector : str
+        must be one of ['CTS', 'industry']
+    detailed : bool, default False
+        Throughput to functions disagg_temporal_industry(),
+        disagg_temporal_gas_CTS() and disagg_temporal_power_CTS(). If True
+        energy use per branch and disctrict get disaggreagated.
+        Otherwise just the energy use per district
+    use_nuts3code : bool, default False
+        throughput for spatial disaggregation functions
+        If True use NUTS-3 codes as region identifiers.
+    disagg_ph : bool, default False
+        If True: returns industrial gas consumption fpr process heat by
+                 temperature level
+    state : str, default None
+        Defines state for disaggregation. Needs to be defined, if detailed=True
+    use_blp: bool, default False
+        If True, branch load profiles (blp) are used if available. blp are
+        based on measured consumption data gathered during DemandRegio project.
+    use_hp : bool, default True
+        If True, use HP profiles for electricity consumption for space heating
+        in CTS.
+
+    Returns
+    -------
+    pd.DataFrame
+        index = datetimeindex
+        columns = Districts / (Branches) / Applications
+    """
+    # Step1: Read Input data
+    # variable check
+    assert (source in ['power', 'gas']), "`source` must be in ['power', 'gas']"
+    assert (sector in ['CTS', 'industry']),\
+        "`sector` must be in ['CTS', 'industry']"
+
+    # check if a year was specified
+    cfg = kwargs.get('cfg', get_config())
+    year = kwargs.get("year", cfg["base_year"])
+    # troughput values for the helper function, used for industrial disagg
+    low = kwargs.get("low", 0.4)
+    no_self_gen = kwargs.get("no_self_gen", False)
+
+    # perfom spatial disagg of demand per consumer group and application
+    df_app = disagg_applications(source, sector, disagg_ph,
+                                 use_nuts3code, no_self_gen, year=year)
+    # count how many different applications there are
+    amount_application = len(df_app.columns.unique(level=1))
+    # count how many different wz (industrial/commercial branches) there are
+    amount_wz = len(df_app.columns.unique(level=0))
+
+    if not detailed:  # check if result should be detailed
+        # Create temporal dataset
+        # industry
+        if sector == "industry":
+            if use_blp:     # check if blp should be used
+                assert (source in ['power']), ("`source` must be in set to "
+                                               "'power' if use_blp=True")
+                ec = disagg_temporal_industry_blp(source, detailed,
+                                                  use_nuts3code, low,
+                                                  no_self_gen, year=year)
+            else:
+                ec = disagg_temporal_industry(source, detailed, use_nuts3code,
+                                              low, no_self_gen, year=year)
+        # CTS
+        else:
+            if source == "gas":
+                # this one has a different methodology
+                ec = disagg_temporal_gas_CTS(detailed, use_nuts3code,
+                                             year=year)
+                # wrong column names are corrected
+                ec.columns = ec.columns.set_names(["LK"])
+            # power
+            else:
+                if use_blp:     # check if blp should be used
+                    ec = disagg_temporal_power_CTS_blp(detailed, use_nuts3code,
+                                                       year=year)
+                else:
+                    ec = disagg_temporal_power_CTS(detailed, use_nuts3code,
+                                                   year=year)
+                if use_hp:
+                    hp_load_norm = create_hp_load(detailed,
+                                                  use_nuts3code=False,
+                                                  year=year, state=state)
+                    # upsample hp_load to quarter hours and interpolate, then
+                    # normalize
+                    hp_load_norm = (hp_load_norm.resample('15T').asfreq()
+                                    .interpolate(method='linear',
+                                                 limit_direction='forward',
+                                                 axis=0))
+                    # extend DataFrame by 3 more periods, because it would be
+                    # too short otherwise
+                    extension = pd.DataFrame(index=pd.date_range(
+                        hp_load_norm.index[-1:].values[0], periods=4,
+                        freq='15T')[-3:], columns=hp_load_norm.columns)
+                    hp_load_norm = (hp_load_norm.append(extension)
+                                    .fillna(method='ffill'))
+                    # normalize
+                    hp_load_norm = hp_load_norm.divide(hp_load_norm.sum(),
+                                                       axis=1)
+        # Create temporal dataset with multiindex
+        # creating the multiindex
+        multi_lk = [elem for elem in list(ec.columns)
+                    for _ in range(amount_application)]
+        multi_app = list(df_app.columns.unique(level=1)) * len(ec.columns)
+        tuples = list(zip(*[multi_lk, multi_app]))
+        index = pd.MultiIndex.from_tuples(tuples, names=["LK", "Anwendung"])
+
+        # new df with multiindex columns and datetime as index
+        new_df = pd.DataFrame(columns=index, index=ec.index)
+
+        # print info on the process
+        logger.info("Working on disaggregating the applications for each "
+                    "NUTS-3 region.")
+
+        # percentage-values from the averages of the spatial disagg function
+        # by region and application to use for multiplication
+        percentages = (df_app.mean(level=1, axis=1)
+                       .div(df_app.mean(level=1, axis=1).sum(axis=1), axis=0))
+        # for every lk multiply the consumption with the percentual use for
+        # that application
+        i = 1  # lk counter
+        if use_hp:
+            apps_no_heat = df_app.columns.unique(level=1).drop('Raumwärme')
+            for lk in ec.columns:
+                # provide info how far along the function is
+                if i % 50 == 0:
+                    logger.info("Working on LK {}/{}."
+                                .format(i+1, len(new_df.columns
+                                                 .get_level_values(0)
+                                                 .unique())))
+                i += 1
+                for app in apps_no_heat:
+                    new_df[lk, app] = percentages.loc[lk, app] * ec[lk]
+                # for ambient heating use different energy
+                new_df[lk, 'Raumwärme'] = (df_app.sum(axis=1, level=1)
+                                           .loc[lk, 'Raumwärme']
+                                           * hp_load_norm[lk])
+        else:
+            for lk in ec.columns:
+                if i % 50 == 0:
+                    logger.info("Working on LK {}/{}."
+                                .format(i+1, len(new_df.columns
+                                                 .get_level_values(0)
+                                                 .unique())))
+                i += 1
+                for app in df_app.columns.unique(level=1):
+                    new_df[lk, app] = percentages.loc[lk, app] * ec[lk]
+
+        # Für detailed: Raumwärme für jeden LK und WZ
+        # ((df_app.reorder_levels(order=[1,0], axis=1).loc[:, 'Raumwärme'])
+
+    else:  # results will be "detailed"
+        assert state in list(bl_dict().values()), ("'state' needs to be in "
+                                                   "['SH', 'HH', 'NI', 'HB', "
+                                                   "'NW', 'HE', 'RP', 'BW', "
+                                                   "'BY', 'SL', 'BE', 'BB', "
+                                                   "'MV', 'SN', 'ST', 'TH']")
+        assert isinstance(state, str), "'state' needs to be a string."
+        # create temporal dataset
+        # industry
+        if sector == "industry":
+            if use_blp:
+                assert (source in ['power']), ("`source` must be in set to "
+                                               "'power' if use_blp=True")
+                ec = disagg_temporal_industry_blp_by_state(source, detailed,
+                                                           use_nuts3code, low,
+                                                           no_self_gen,
+                                                           state=state,
+                                                           year=year)
+            else:
+                ec = disagg_temporal_industry_by_state(source, detailed,
+                                                       use_nuts3code, low,
+                                                       no_self_gen,
+                                                       state=state, year=year)
+        # CTS
+        else:
+            if source == "gas":
+                ec = disagg_temporal_gas_CTS_by_state(detailed, use_nuts3code,
+                                                      state=state, year=year)
+                # wrong column names are corrected
+                ec.columns = ec.columns.set_names(["LK", "WZ"])
+            # power
+            else:
+                if use_blp:
+                    ec = disagg_temporal_power_CTS_blp_by_state(detailed,
+                                                                use_nuts3code,
+                                                                state=state,
+                                                                year=year)
+                else:
+                    ec = disagg_temporal_power_CTS_by_state(detailed,
+                                                            use_nuts3code,
+                                                            state=state,
+                                                            year=year)
+                if use_hp:
+                    hp_load_norm = create_hp_load(detailed,
+                                                  use_nuts3code=False,
+                                                  year=year, state=state)
+                    # upsample hp_load to quarter hours and interpolate, then
+                    # normalize
+                    hp_load_norm = (hp_load_norm.resample('15T').asfreq()
+                                    .interpolate(method='linear',
+                                                 limit_direction='forward',
+                                                 axis=0))
+                    # extend DataFrame by 3 more periods, because it would be
+                    # too short otherwise
+                    extension = pd.DataFrame(index=pd.date_range(
+                        hp_load_norm.index[-1:].values[0], periods=4,
+                        freq='15T')[-3:], columns=hp_load_norm.columns)
+                    hp_load_norm = (hp_load_norm.append(extension)
+                                    .fillna(method='ffill'))
+                    # normalize
+                    hp_load_norm = hp_load_norm.divide(hp_load_norm.sum(),
+                                                       axis=1)
+        # number of regions
+        regions = list(ec.columns.get_level_values(0).unique())
+        amount_regions = len(regions)
+        # creating the multiindex
+        multi_lk = [elem for elem in regions
+                    for _ in range(amount_application * amount_wz)]
+        multi_wz = [elem for elem in df_app.columns.unique(level=0)
+                    for _ in range(amount_application)] * amount_regions
+        multi_app = (list(df_app.columns.unique(level=1))
+                     * amount_regions
+                     * amount_wz)
+        tuples = list(zip(*[multi_lk, multi_wz, multi_app]))
+        columns = pd.MultiIndex.from_tuples(tuples, names=["LK", "WZ",
+                                                           "Anwendungen"])
+
+        # new df with multiindex columns and datetime as index
+        new_df = pd.DataFrame(columns=columns, index=ec.index)
+        # optional, give memory usage info
+        # logger.info('Approximate memory usage of Dataframe in MB will be: '
+        #           + str(new_df.memory_usage(deep=True).sum()/1000000))
+
+        # percentage-values from the averages of the spatial disagg function
+        # by region, industrial branch and app to use for multiplication
+        percentages = (df_app.div(df_app.sum(axis=1, level=0), level=0).mean())
+
+        i = 1  # lk counter
+        # for every lk and WZ multiply the consumption with the percentual
+        # use for that application
+        if use_hp:  # if heat pump load profile should be used
+            apps_no_heat = df_app.columns.unique(level=1).drop('Raumwärme')
+            # for every region
+            for lk in new_df.columns.get_level_values(0).unique():
+                # provide info how far along the function is
+                if i % 4 == 0:
+                    logger.info("Working on LK {}/{}."
+                                .format(i+1, len(new_df.columns
+                                                 .get_level_values(0)
+                                                 .unique())))
+                i += 1
+                for branch in new_df.columns.get_level_values(1).unique():
+                    for app in apps_no_heat:
+                        new_df[lk, branch, app] = (percentages.loc[branch, app]
+                                                   * ec[lk, branch])
+                    new_df[lk, branch, 'Raumwärme'] = ((df_app.loc[lk]
+                                                       [branch, 'Raumwärme'])
+                                                       * (hp_load_norm
+                                                          [str(lk),
+                                                           str(branch)]))
+        else:  # HP load profile is not used
+            # for every region
+            for lk in new_df.columns.get_level_values(0).unique():
+                # provide info how far along the function is
+                if i % 50 == 0:
+                    logger.info("Working on LK {}/{}."
+                                .format(i+1, len(new_df.columns
+                                                 .get_level_values(0)
+                                                 .unique())))
+                i += 1
+                for branch in new_df.columns.get_level_values(1).unique():
+                    for app in new_df.columns.get_level_values(2).unique():
+                        new_df[lk, branch, app] = (percentages.loc[branch, app]
+                                                   * ec[lk, branch])
+
+    # Plausibility check:
+    msg = ('The sum of consumptions (={:.3f}) and the sum of disaggrega'
+           'ted consumptions (={:.3f}) do not match! Please check algorithm!')
+    if detailed:
+        # adding the complete consumption for every given branch before the
+        # disaggregation
+        total_sum = 0
+        for branch in new_df.columns.get_level_values(1).unique():
+            total_sum += ec.xs(branch, level="WZ", axis=1).sum().sum()
+    else:
+        # consumption trough all timesteps in every district
+        total_sum = ec.sum().sum()
+    # total sum of all disaggregated consumptions
+    disagg_sum = new_df.sum().sum()
+    assert np.isclose(total_sum, disagg_sum), msg.format(total_sum, disagg_sum)
+
+    return new_df
 
 
 def create_hp_load(detailed=False, p_ground=0.36, p_air=0.58,
@@ -68,20 +892,20 @@ def create_hp_load(detailed=False, p_ground=0.36, p_air=0.58,
 
     # get normalised heat load profiles
     if os.path.exists(path) and not detailed:
-        logger.info('Reading existing heat norm timeseries for detailed: ' +
-                    str(detailed))
+        logger.info('Reading existing heat norm timeseries for detailed: '
+                    + str(detailed))
         heat_norm = pd.read_csv(path, index_col=0, header=[0])
         heat_norm.index = pd.to_datetime(heat_norm.index)
         heat_norm.columns = heat_norm.columns.astype(int)
     if os.path.exists(path) and detailed:
-        logger.info('Reading existing heat norm timeseries for detailed: ' +
-                    str(detailed))
+        logger.info('Reading existing heat norm timeseries for detailed: '
+                    + str(detailed))
         heat_norm = pd.read_csv(path, index_col=0, header=[0, 1])
         heat_norm.index = pd.to_datetime(heat_norm.index)
     else:
-        logger.info('Creating heat norm timeseries for detailed: ' +
-                    str(detailed))
-        heat_norm, gas_total, gas_tempinde = (create_heat_norm(
+        logger.info('Creating heat norm timeseries for detailed: '
+                    + str(detailed))
+        heat_norm, gas_total, gas_tempinde = (create_heat_norm_cts(
             detailed=detailed, year=year, state=state))
 
     # Creating COP timeseries
@@ -108,7 +932,7 @@ def create_hp_load(detailed=False, p_ground=0.36, p_air=0.58,
     return ec_heat
 
 
-def create_heat_norm(detailed=False, state=None, **kwargs):
+def create_heat_norm_cts(detailed=False, state=None, **kwargs):
     """
     Creates normalised heat demand timeseries for CTS per NUTS-3, and branch
     if detailed is set to True.
@@ -180,15 +1004,16 @@ def create_heat_norm(detailed=False, state=None, **kwargs):
     else:
         logger.info('Disaggregating detailed temperature independent gas'
                     ' consumption for state: ' + str(state))
-        gas_tempinde = (disagg_temporal_gas_CTS_water_by_state(
-                                    detailed=detailed, use_nuts3code=False,
-                                    state=state, year=year))
+        gas_tempinde = (
+            disagg_temporal_gas_CTS_water_by_state(detailed=detailed,
+                                                   use_nuts3code=False,
+                                                   state=state, year=year))
 
     # create space heating timeseries: difference between total heat demand
     # and water heating demand
     heat_norm = (gas_total - gas_tempinde).clip(lower=0)
 
-    temp_allo = resample_t_allo()
+    temp_allo = resample_t_allo(year=year)
     # clip heat demand above heating threshold
     if detailed:
         df = (heat_norm
@@ -202,21 +1027,237 @@ def create_heat_norm(detailed=False, state=None, **kwargs):
 
     # normalise
     heat_norm = heat_norm.divide(heat_norm.sum(axis=0), axis=1)
+    gas_tempinde_norm = gas_tempinde.divide(gas_tempinde.sum(axis=0), axis=1)
 
-    if not detailed:
-        # safe as csv
-        heat_norm.to_csv(data_out('CTS_heat_norm_' + str(year) + '.csv'))
+    # if not detailed:
+    #     # safe as csv
+    #     heat_norm.to_csv(data_out('CTS_heat_norm_' + str(year) + '.csv'))
+    # else:
+    #     heat_norm.to_csv(data_out('CTS_heat_norm_' + str(state) + '_'
+    #                               + str(year) + '.csv'))
+
+    return heat_norm, gas_total, gas_tempinde_norm
+
+
+def create_heat_norm_industry(state=None, slp='KO', **kwargs):
+    """
+    Creates normalised heat demand timeseries for CTS per NUTS-3, and branch
+    if detailed is set to True.
+
+    Parameters
+    ----------
+    detailed : bool, default False
+        If True heat demand per branch and disctrict is calculated.
+        Otherwise just the heat demand per district.
+    state : str, default None
+        Specifies state. Only needed if detailed=True. Must by one of the
+        entries of bl_dict().values(),
+        ['SH', 'HH', 'NI', 'HB', 'NW', 'HE', 'RP', 'BW', 'BY', 'SL', 'BE',
+         'BB', 'MV', 'SN', 'ST', 'TH']
+    slp : str, default "KO"
+        musst be one of ['BD', 'BH', 'GA', 'GB', 'HA', 'KO', 'MF', 'MK', 'PD']
+
+    Returns
+    -------
+
+    """
+    # get base year
+    cfg = kwargs.get('cfg', get_config())
+    year = kwargs.get('year', cfg['base_year'])
+    # Idea: create normalized heat profile from gas SLP for offices but use
+    # industry consumption
+    gv_lk = (disagg_applications(source="gas", sector="industry",
+                                 use_nuts3code=False, year=year))
+    col = pd.IndexSlice
+    gv_lk_total = gv_lk.copy()
+    gv_lk_tempinde = gv_lk.loc[:, col[:, ['Warmwasser',
+                                          'Mechanische \nEnergie',
+                                          'Prozesswärme']]]
+
+    # get daily allocation temperature
+    temperatur_df = t_allo(year=year)
+    # clip at 13 for hot water, below 13°C the water heating demand is assumed
+    # to be constant
+    temperatur_df_clip = temperatur_df.clip(13)
+    # check if gap year
+    if ((year % 4 == 0) & (year % 100 != 0) | (year % 4 == 0)
+            & (year % 100 == 0) & (year % 400 == 0)):
+        hours = 8784
     else:
-        heat_norm.to_csv(data_out('CTS_heat_norm_' + str(state) + '_' +
-                                  str(year) + '.csv'))
+        hours = 8760
+        
+    ## make a dict with nuts3 as keys (lk) and nuts1 as values (bl)
+    nuts3_list = temperatur_df.columns
+    nuts1_list = [bl_dict().get(int(i[: -3]))
+                  for i in temperatur_df.columns.astype(str)]
+    nuts3_nuts1_dict = dict(zip(nuts3_list, nuts1_list))
 
-    return heat_norm, gas_total, gas_tempinde
+    # count how many different regions there are
+    regions = [int(k) for k, v in nuts3_nuts1_dict.items() if v == state]
+    amount_regions = len(regions)
+    
+    # new DataFrames for results
+    gas_total = pd.DataFrame(columns=regions,
+                          index=pd.date_range((str(year) + '-01-01'),
+                                          periods=hours, freq='H'))
+    gas_temp_inde = pd.DataFrame(columns=regions,
+                          index=pd.date_range((str(year) + '-01-01'),
+                                          periods=hours, freq='H'))
+    
+    # get weekday-factors per day
+    F_wd = (gas_slp_weekday_params(state, year=year)
+            .set_index('Date')['FW_'+str(slp)]).to_frame()
+    # get h-value per day
+    h_slp = h_value(slp, [str(i) for i in regions], temperatur_df)
+    # get h-value for hot water per day
+    h_slp_water = h_value_water(slp, [str(i) for i in regions],
+                                temperatur_df_clip)
+    
+    # multiply h_values and week day values per day
+    tw = pd.DataFrame(np.multiply(h_slp.values, F_wd.values),
+                          index=h_slp.index, columns=h_slp.columns.astype(int))
+    tw_water = pd.DataFrame(np.multiply(h_slp_water.values, F_wd.values),
+                          index=h_slp_water.index,
+                          columns=h_slp_water.columns.astype(int))
+
+    # normalize
+    tw_norm = tw/tw.sum()
+    tw_water_norm = tw_water/tw_water.sum()
+    # set DatetimeIndex
+    tw_norm.index = pd.DatetimeIndex(tw_norm.index)
+    tw_water_norm.index = pd.DatetimeIndex(tw_water_norm.index)
+    # multiply with gas demand per region
+    ts_total = tw_norm.multiply(gv_lk_total.sum(axis=1).loc[regions])
+    ts_water = tw_water_norm.multiply(gv_lk_tempinde.sum(axis=1).loc[regions])
+    
+    # extend by one day because when resampling to hours later, this day
+    # is lost otherwise
+    last_day = ts_total.copy()[-1:]
+    last_day.index = last_day.index + timedelta(1)
+    ts_total = (ts_total.append(last_day).resample('H').pad()[:-1])
+    # extend tw_water by one day and resample
+    ts_water = (ts_water.append(last_day).resample('H').pad()[:-1])
+    
+    # get temperature dataframe for hourly disaggregation
+    t_allo_df = temperatur_df[[str(i) for i in regions]]
+    for col in t_allo_df.columns:
+        t_allo_df[col].values[t_allo_df[col].values < -15] = -15
+        t_allo_df[col].values[(t_allo_df[col].values > -15)
+                              & (t_allo_df[col].values < -10)] = -10
+        t_allo_df[col].values[(t_allo_df[col].values > -10)
+                              & (t_allo_df[col].values < -5)] = -5
+        t_allo_df[col].values[(t_allo_df[col].values > -5)
+                              & (t_allo_df[col].values < 0)] = 0
+        t_allo_df[col].values[(t_allo_df[col].values > 0)
+                              & (t_allo_df[col].values < 5)] = 5
+        t_allo_df[col].values[(t_allo_df[col].values > 5)
+                              & (t_allo_df[col].values < 10)] = 10
+        t_allo_df[col].values[(t_allo_df[col].values > 10)
+                              & (t_allo_df[col].values < 15)] = 15
+        t_allo_df[col].values[(t_allo_df[col].values > 15)
+                              & (t_allo_df[col].values < 20)] = 20
+        t_allo_df[col].values[(t_allo_df[col].values > 20)
+                              & (t_allo_df[col].values < 25)] = 25
+        t_allo_df[col].values[(t_allo_df[col].values > 25)] = 100
+        t_allo_df = t_allo_df.astype('int32')
+    # for tempindependent consumption of ts_water t_allo_df = 100
+    t_allo_water_df = t_allo_df.copy()
+    t_allo_water_df.values[:] = 100
+
+    # rewrite calendar for better data handling later
+    calender_df = (gas_slp_weekday_params(state, year=year)
+                   [['Date', 'MO', 'DI', 'MI', 'DO', 'FR', 'SA', 'SO']])
+    # add temperature data to calendar
+    temp_calender_df = (pd.concat([calender_df.reset_index(),
+                                   t_allo_df.reset_index()], axis=1))
+    temp_calender_water_df = (pd.concat([calender_df.reset_index(),
+                                   t_allo_water_df.reset_index()], axis=1))
+    # add weekdays to calendar
+    temp_calender_df['Tagestyp'] = 'MO'
+    temp_calender_water_df['Tagestyp'] = 'MO'
+    for typ in ['DI', 'MI', 'DO', 'FR', 'SA', 'SO']:
+        (temp_calender_df.loc[temp_calender_df[typ], 'Tagestyp']) = typ
+        (temp_calender_water_df
+         .loc[temp_calender_water_df[typ], 'Tagestyp']) = typ
+    # get hourly percentages per slp and region, here only one slp is used    
+    for lk in regions:
+        # for calendar for gas total
+        temp_cal = temp_calender_df.copy()
+        temp_cal = temp_cal[['Date', 'Tagestyp', str(lk)]].set_index("Date")
+        last_hour = temp_cal.copy()[-1:]
+        last_hour.index = last_hour.index + timedelta(1)
+        temp_cal = temp_cal.append(last_hour)
+        temp_cal = temp_cal.resample('H').pad()
+        temp_cal = temp_cal[:-1]
+        temp_cal['Stunde'] = pd.DatetimeIndex(temp_cal.index).time
+        temp_cal = temp_cal.set_index(["Tagestyp", str(lk), 'Stunde'])
+        f = ('Lastprofil_{}.xls'.format(slp))
+        slp_profil = pd.read_excel(data_in('temporal',
+                                           'Gas Load Profiles', f))
+        slp_profil = pd.DataFrame(slp_profil.set_index(['Tagestyp',
+                                    'Temperatur\nin °C\nkleiner']))
+        slp_profil.columns = pd.to_datetime(slp_profil.columns,
+                                            format='%H:%M:%S')
+        slp_profil.columns = pd.DatetimeIndex(slp_profil.columns).time
+        slp_profil = slp_profil.stack()
+        temp_cal['Prozent'] = [slp_profil[x] for x in temp_cal.index]
+        # multiplication of gas demand with hourly factors
+        gas_total[int(lk)] = (ts_total[lk].values
+                           * temp_cal['Prozent'].values/100)
+        # for calendar for calendar gas temp independent
+        temp_cal = temp_calender_water_df.copy()
+        temp_cal = temp_cal[['Date', 'Tagestyp', str(lk)]].set_index("Date")
+        last_hour = temp_cal.copy()[-1:]
+        last_hour.index = last_hour.index + timedelta(1)
+        temp_cal = temp_cal.append(last_hour)
+        temp_cal = temp_cal.resample('H').pad()
+        temp_cal = temp_cal[:-1]
+        temp_cal['Stunde'] = pd.DatetimeIndex(temp_cal.index).time
+        temp_cal = temp_cal.set_index(["Tagestyp", str(lk), 'Stunde'])
+        f = ('Lastprofil_{}.xls'.format(slp))
+        slp_profil = pd.read_excel(data_in('temporal',
+                                           'Gas Load Profiles', f))
+        slp_profil = pd.DataFrame(slp_profil.set_index(['Tagestyp',
+                                    'Temperatur\nin °C\nkleiner']))
+        slp_profil.columns = pd.to_datetime(slp_profil.columns,
+                                            format='%H:%M:%S')
+        slp_profil.columns = pd.DatetimeIndex(slp_profil.columns).time
+        slp_profil = slp_profil.stack()
+        temp_cal['Prozent'] = [slp_profil[x] for x in temp_cal.index]
+        # multiplication of temperatur independent gas demand with hourly
+        # factors
+        gas_temp_inde[int(lk)] = (ts_water[lk].values
+                                  * temp_cal['Prozent'].values/100)
+
+    # create space heating timeseries: difference between total heat demand
+    # and water heating demand
+    heat_norm = (gas_total - gas_temp_inde).clip(lower=0)
+
+    temp_allo = (resample_t_allo(temp_df=temperatur_df,
+                                 year=year)[[(i) for i in regions]])
+    heat_norm = heat_norm[temp_allo[temp_allo > 13].isnull()].fillna(0)
+
+    # normalise
+    heat_norm = heat_norm.divide(heat_norm.sum(axis=0), axis=1)
+    gas_tempinde_norm = gas_temp_inde.divide(gas_temp_inde.sum(axis=0), axis=1)
+
+    return heat_norm, gas_total, gas_tempinde_norm
 
 
-def cop_ts(**kwargs):
+def cop_ts(sink_t=40, source='ambient', delta_t=None, **kwargs):
     """
     Creates COP timeseries for ground/air/water heat pumps with floor heating.
 
+    Parameters
+    ----------
+    sink_t : float, default 40
+        temperature level of heat sink
+    source : str, must be in ['ambient', 'waste heat'], default 'ambient'
+        defines heat source for heat pump. If 'ambient', sink_t must be
+        defined. if 'waste heat' delta_t must be defined.
+    delata_t : float, default None.
+        must be defined, if source is set to 'waste heat'. defines temperature
+        difference between sink and source for heat pump. should not exceed 80.
     Returns
     -------
     air_floor_cop : pd.DataFrame
@@ -229,6 +1270,8 @@ def cop_ts(**kwargs):
         index = datetimeindex
         columns = Districts
     """
+    assert source in ['ambient', 'waste heat'], ("'source' needs to be in "
+                                                 "['ambient', 'waste heat'].")
     # get base year (if a future year, assing historical weather year)
     cfg = kwargs.get('cfg', get_config())
     base_year = kwargs.get('year', cfg['base_year'])
@@ -267,27 +1310,126 @@ def cop_ts(**kwargs):
     water_t = pd.DataFrame(index=ground_t.index,
                            columns=ground_t.columns,
                            data=10 - 5)
+    if source == 'ambient':
+        # sink temperature
+        sink_t = pd.DataFrame(index=ground_t.index,
+                              columns=ground_t.columns,
+                              data=sink_t)
+        # create cop timeseries based on temperature difference between source
+        # and sink
+        air_floor_cop = cop_curve((sink_t - air_t), 'air')
+        ground_floor_cop = cop_curve((sink_t - ground_t), 'ground')
+        water_floor_cop = cop_curve((sink_t - water_t), 'water')
 
-    # sink temperature of 40°C (floor heatin)
-    floor_t = pd.DataFrame(index=ground_t.index,
-                           columns=ground_t.columns,
-                           data=40)
+        return air_floor_cop, ground_floor_cop, water_floor_cop
 
-    # create cop timeseries based on temperature difference between source
-    # and sink
-    air_floor_cop = cop_curve((floor_t - air_t), 'air')
-    ground_floor_cop = cop_curve((floor_t - ground_t), 'ground')
-    water_floor_cop = cop_curve((floor_t - water_t), 'water')
+    else:
+        assert isinstance(delta_t, (int, float)), ("'delta_t' needs to be a "
+                                                   "number.")
+        # temperature difference between source and sink
+        delta_t = pd.DataFrame(index=ground_t.index,
+                               columns=ground_t.columns,
+                               data=delta_t)
+        # create cop timeseries based on temperature difference between source
+        # and sink. use regression function from Arpagaus et al. (2018)
+        # "Review - High temperature heat pumps: Market overview, state of
+        #  the art, research Status, refrigerants, and application potentials",
+        # Energy, 2018
+        high_temp_hp_cop = 68.455*(delta_t.pow(-0.76))
 
-    return air_floor_cop, ground_floor_cop, water_floor_cop
+        return high_temp_hp_cop
 
 
 # %% Utility functions
 
 
-def resample_t_allo(**kwargs):
+def projection_fuel_switch_share(df_fuel_switch, target_year):
+    """
+    Projects fuel switch share by branch to target year.
+
+    Parameters
+    ----------
+    df_fuel_switch : pd.DataFrame()
+        Data which is projected.
+    target_year: int
+        Year for which the share should be projected.
+
+    Returns
+    -------
+    None.
+
+    """
+    if target_year <= date.today().year:
+        logger.info('Target year is lower than current year. No projection is'
+                    ' done. Target year:' + str(target_year) + ' and Current'
+                    ' year: ' + str(date.today().year))
+        # as there is no projection the share of fuel which is switched away
+        # from is 0.
+        for col in df_fuel_switch.columns:
+            df_fuel_switch[col].values[:] = 0
+
+        return df_fuel_switch
+    else:
+        # define current year
+        start_year = int(date.today().year)
+        # define yearly step from today to 2045
+        df_scaling = df_fuel_switch.div(2045-start_year)
+        # project to target year
+        df_fuel_switch_projected = df_scaling*(target_year - start_year)
+        return df_fuel_switch_projected
+
+
+def read_fuel_switch_share(sector, switch_to):
+    """
+    Read fuel switch shares by branch from input data for year 2045.
+
+    Parameters
+    -------
+    sector : str
+        must be one of ['CTS', 'industry']
+    switch_to: str
+        must be one of ['power', 'hydrogen']
+    Returns
+    -------
+    pd.DataFrame()
+
+    """
+    assert (sector in ['CTS', 'industry']),\
+        "`sector` must be in ['CTS', 'industry']"
+    # reading and preapring the table
+    PATH = data_in("dimensionless", "fuel_switch_keys.xlsx")
+    if sector == "CTS":
+        assert (switch_to in ['power']),\
+            "`switch_to` must be 'power' for CTS sector."
+        df_fuel_switch = pd.read_excel(PATH, sheet_name=("Gas2Power CTS 2045"),
+                                       skiprows=1)
+    if sector == 'industry':
+        assert (switch_to in ['power', 'hydrogen']),\
+            "`switch_to` must be in ['power', 'hydrogen'] for industry sector."
+        if switch_to == 'power':
+            df_fuel_switch = pd.read_excel(PATH,
+                                           sheet_name=("Gas2Power "
+                                                       "industry 2045"),
+                                           skiprows=1)
+        else:
+            df_fuel_switch = pd.read_excel(PATH,
+                                           sheet_name=("Gas2Hydrogen"
+                                                       " industry 2045"),
+                                           skiprows=1)
+    # cleaning the table
+    # selecting only the rows with WZ and not the name columns
+    df_fuel_switch = (df_fuel_switch
+                      .loc[[isinstance(x, int) for x in df_fuel_switch["WZ"]]]
+                      .set_index("WZ")
+                      .copy())
+    return df_fuel_switch
+
+
+def resample_t_allo(temp_df=None, **kwargs):
     """
     Resamples the allocation temperature to match other dataframes in plot
+    Parameters:
+    temp_df : pd.DataFrame with temperature data, default None
     """
     # get base year
     cfg = kwargs.get('cfg', get_config())
@@ -303,7 +1445,10 @@ def resample_t_allo(**kwargs):
     else:
         periods = 35040
     date = pd.date_range((str(year) + '-01-01'), periods=periods / 4, freq='H')
-    df = t_allo()
+    if temp_df is not None:
+        df = temp_df
+    else:
+        df = t_allo(year=year)
     df.index = pd.to_datetime(df.index)
     last_hour = df.copy()[-1:]
     last_hour.index = last_hour.index + timedelta(1)
