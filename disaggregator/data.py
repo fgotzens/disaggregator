@@ -303,8 +303,8 @@ def generate_specific_consumption_per_branch(**kwargs):
     # get electricity and gas consumption from database
     x = True
     year1 = year
-    if year1 not in range(2000, 2036):
-        raise ValueError("`year` must be between 2000 and 2035")
+    if year1 not in range(2000, 2051):
+        raise ValueError("`year` must be between 2000 and 2050")
     while(x):
         try:
             vb_wz = database_get('spatial', table_id=71, year=year1)
@@ -512,8 +512,8 @@ def generate_specific_consumption_per_branch_and_district(iterations_power=8,
     # get latest "Regionalstatistik" from Database
     x = True
     year1 = year
-    if year1 not in range(2000, 2036):
-        raise ValueError("`year` must be between 2000 and 2035")
+    if year1 not in range(2000, 2051):
+        raise ValueError("`year` must be between 2000 and 2050")
     if year1 < 2003:
         vb_LK = database_get('spatial', table_id=15, year=2003)
         x = False
@@ -1486,12 +1486,12 @@ def heat_demand_buildings(**kwargs):
     return df
 
 
-def efficiency_enhancement(source, **kwargs):
+def efficiency_effect_app(source, sector, **kwargs):
     """
     Read and return the efficiency enhancement for power or gas consumption
-    per branch. Positive efficiency enhancement will decrease specific energy
-    consumption. Negative efficiency enhancement will increase specific energy
-    consumption. Efficiency enhancement rates are only considered from year
+    per application. Positive efficiency enhancement will decrease specific
+    energy consumption. Negative efficiency enhancement will increase specific
+    energy consumption. Efficiency enhancement rates are considered from year
     2018 onwards.
 
     Parameters
@@ -1506,34 +1506,48 @@ def efficiency_enhancement(source, **kwargs):
     """
     cfg = kwargs.get('cfg', get_config())
     year = kwargs.get('year', cfg['base_year'])
-    if year in range(2019, 2036):
-        # if year is in the future, function returns a df with calculated
-        # enhancemen-rates based on year 2018
-        es_rate = (pd.read_excel(data_in('temporal',
-                                         'Efficiency_Enhancement_Rates.xlsx'))
-                   .set_index('WZ'))
-        df = pow((-es_rate + 1), (year - 2018))
-        if source == 'power':
-            df = df['Effizienzsteigerungsrate Strom']
-        elif source == 'gas':
-            df = df['Effizienzsteigerungsrate Gas']
-        else:
-            raise ValueError("`source` must be in ['power', 'gas']")
-        return df
+
+    # read efficiency rates from
+    if ((sector == 'CTS') & (source == 'power')):
+        eff_rate = (pd.read_excel(
+            data_in('temporal',
+                    'Efficiency_Enhancement_Rates_Applications.xlsx'),
+            sheet_name="eff_enhance_el_cts")
+               .set_index('until year'))
+    elif ((sector == 'industry') & (source == 'power')):
+        eff_rate = (pd.read_excel(
+            data_in('temporal',
+                    'Efficiency_Enhancement_Rates_Applications.xlsx'),
+            sheet_name="eff_enhance_el_industry")
+               .set_index('until year'))
+    elif ((sector == 'CTS') & (source == 'gas')):
+        eff_rate = (pd.read_excel(
+            data_in('temporal',
+                    'Efficiency_Enhancement_Rates_Applications.xlsx'),
+            sheet_name="eff_enhance_gas_cts")
+               .set_index('until year'))
     else:
+        eff_rate = (pd.read_excel(
+            data_in('temporal',
+                    'Efficiency_Enhancement_Rates_Applications.xlsx'),
+            sheet_name="eff_enhance_gas_industry")
+               .set_index('until year'))
+
+    # if year is in the future, function returns a df with calculated
+    # enhancement-levels based on year 2018
+    if year in range(2019, 2051):
+        # calculate percentage of consumption reduction
+        # due to efficiency effect
+        df = (pow((-eff_rate.iloc[0] + 1), min((year - 2018), (2035 - 2018)))
+              * pow((-eff_rate.iloc[1] + 1), max((year - 2035), (0))))
+    elif (year <= 2018):
         # if year is below 2019, function returns df with the same format as
-        # above, but only with "1"-entries. This could be done more elegantly.
-        es_rate = (pd.read_excel(data_in('temporal',
-                                         'Efficiency_Enhancement_Rates.xlsx'))
-                   .set_index('WZ'))
-        df = pow((-es_rate + 1), (1))
-        if source == 'power':
-            df = df['Effizienzsteigerungsrate Strom']
-        elif source == 'gas':
-            df = df['Effizienzsteigerungsrate Gas']
-        else:
-            raise ValueError("`source` must be in ['power', 'gas']")
-        return df
+        # above, but only with "1"-entries.
+        df = pow((-eff_rate.iloc[0] + 1), 0)
+    else:
+        raise ValueError("`year` must be lower than 2050.")
+
+    return df
 
 
 def get_current_efficiency_level():  # TBD!
