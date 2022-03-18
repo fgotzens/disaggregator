@@ -23,7 +23,7 @@ Provides functions for spatial disaggregation
 from .data import (elc_consumption_HH, heat_consumption_HH, gas_consumption_HH,
                    population, households_per_size, income, stove_assumptions,
                    living_space, hotwater_shares, heat_demand_buildings,
-                   employees_per_branch, efficiency_enhancement,
+                   employees_per_branch, efficiency_effect_app,
                    generate_specific_consumption_per_branch_and_district)
 from .config import (dict_region_code, get_config, data_in)
 import numpy as np
@@ -396,8 +396,8 @@ def disagg_CTS_industry(source, sector,
               * spez_vb.values),
         index=spez_vb.index,
         columns=spez_vb.columns))
-    df = df.multiply(efficiency_enhancement(source, year=year).transpose()
-                     .loc[df.index], axis=0)
+    # df = df.multiply(efficiency_enhancement(source, year=year).transpose()
+    #                  .loc[df.index], axis=0)
     if use_nuts3code:
         df = df.rename(columns=dict_region_code(keys='ags_lk',
                                                 values='natcode_nuts3'))
@@ -405,7 +405,7 @@ def disagg_CTS_industry(source, sector,
 
 
 def disagg_applications(source, sector, disagg_ph=False, use_nuts3code=False,
-                        no_self_gen=False,  **kwargs):  # **kwargs
+                        no_self_gen=False,  **kwargs):
     """
     Perfrom dissagregation based on applications of the final energy usage
 
@@ -478,7 +478,7 @@ def disagg_applications(source, sector, disagg_ph=False, use_nuts3code=False,
         if disagg_ph:
             # check if disaggregation per temperature level is wanted
             print("Message: No disaggregation on temperature-levels has "
-                      "been done, since there is no data for CTS-sector.")
+                  "been done, since there is no data for CTS-sector.")
     if sector == "industry":
         ec = disagg_CTS_industry(source, sector, use_nuts3code, no_self_gen,
                                  year=year)
@@ -532,6 +532,49 @@ def disagg_applications(source, sector, disagg_ph=False, use_nuts3code=False,
     assert np.isclose(total_sum, disagg_sum), msg.format(total_sum, disagg_sum)
     return new_df
 
+
+def disagg_applications_eff(source, sector, disagg_ph=False,
+                            use_nuts3code=False, no_self_gen=False, **kwargs):
+    """
+    
+    Parameters
+    ----------
+    source : TYPE
+        DESCRIPTION.
+    sector : TYPE
+        DESCRIPTION.
+    disagg_ph : TYPE, optional
+        DESCRIPTION. The default is False.
+    use_nuts3code : TYPE, optional
+        DESCRIPTION. The default is False.
+    no_self_gen : TYPE, optional
+        DESCRIPTION. The default is False.
+    **kwargs : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    None.
+
+    """
+    # check if a year was specified
+    cfg = kwargs.get('cfg', get_config())
+    year = kwargs.get("year", cfg["base_year"])
+    # call disagg_applications to get projected demand for given year
+    df_app = disagg_applications(source, sector, disagg_ph=False,
+                                 use_nuts3code=False, no_self_gen=False,
+                                 year=year)
+
+    # call efficiency function to get level of consumption reduction due to
+    # efficiency advancements
+    df_eff = efficiency_effect_app(source, sector, year=year)
+
+    # multiply consumption reduction due to efficiency gains with 
+    df_app_eff = df_app.multiply(df_eff, level=1, axis=1)
+
+    return df_app_eff
+    
+    
 
 # %% Utility functions
 
