@@ -30,8 +30,7 @@ from .data import (elc_consumption_HH, households_per_size, population,
                    zve_application_profiles, database_shapes,
                    CTS_power_slp_generator, t_allo,
                    shift_load_profile_generator, gas_slp_weekday_params,
-                   percentage_EFH_MFH, regional_branch_load_profiles,
-                   get_current_efficiency_level)
+                   percentage_EFH_MFH, regional_branch_load_profiles)
 from .spatial import (disagg_CTS_industry, disagg_households_power,
                       disagg_households_gas, disagg_applications)
 # from .heat import (create_hp_load)  ## TBD: fix that import error
