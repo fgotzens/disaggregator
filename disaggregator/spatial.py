@@ -374,8 +374,9 @@ def disagg_CTS_industry(source, sector,
     # generate specific consumptions
     cfg = kwargs.get('cfg', get_config())
     year = kwargs.get('year', cfg['base_year'])
-    [spez_sv, spez_gv] = generate_specific_consumption_per_branch_and_district(
-        8, 8, no_self_gen, year=year)
+    [spez_sv, spez_gv,  df_f_sv_no_self_gen, df_f_gv_no_self_gen] = (
+        generate_specific_consumption_per_branch_and_district(
+            8, 8, no_self_gen, year=year))
     if source == 'power':
         spez_vb = spez_sv
     else:
@@ -401,7 +402,7 @@ def disagg_CTS_industry(source, sector,
     if use_nuts3code:
         df = df.rename(columns=dict_region_code(keys='ags_lk',
                                                 values='natcode_nuts3'))
-    return df
+    return [df, df_f_sv_no_self_gen, df_f_gv_no_self_gen]
 
 
 def disagg_applications(source, sector, disagg_ph=False, use_nuts3code=False,
@@ -423,10 +424,9 @@ def disagg_applications(source, sector, disagg_ph=False, use_nuts3code=False,
         disagg_CTS_industry(
                             use_nuts3code = False)
         If True use NUTS-3 codes as region identifiers.
-    no_self_gen : bool, default False
+    no_self_gen : bool, default True
         throughput for
-        disagg_CTS_industry(
-                            no_self_gen=False)
+        disagg_CTS_industry(no_self_gen=True)
         If True: returns power and gas consumption without self
                  generation, resulting energy consumption will be lower
 
@@ -446,13 +446,17 @@ def disagg_applications(source, sector, disagg_ph=False, use_nuts3code=False,
 
     # reading and preapring the consumption table
     # reading the disaggregation keys table
-    PATH = data_in("dimensionless", "application_disaggreagtion_keys.xlsx")
+    PATH = data_in("dimensionless", "Decomposition Factors.xlsx")
 
     if source == "power":
         eev = pd.read_excel(PATH, sheet_name=("Endenergieverbrauch Strom"))
+        eev.drop(['Strom Netzbezug', 'Strom Eigenerzeugung'],
+                 axis=1, inplace=True)
 
     if source == "gas":
         eev = pd.read_excel(PATH, sheet_name=("Endenergieverbrauch Gas"))
+        eev.drop(['Anteil Erdgas am Verbrauch aller Gase',
+                  'Energetischer Erdgasverbrauch'], axis=1, inplace=True)
         if disagg_ph:  # read temperature level disaggregation factors
             ft = pd.read_excel(PATH,
                                sheet_name=("Prozesswärme_Temperaturniveaus"))
@@ -471,8 +475,8 @@ def disagg_applications(source, sector, disagg_ph=False, use_nuts3code=False,
     # calling the spatial disaggregation function which will be further
     # disaggregated
     if sector == "CTS":
-        ec = disagg_CTS_industry(source, sector, use_nuts3code, no_self_gen,
-                                 year=year)
+        [ec, f_sv_no_self_gen, f_gv_no_self_gen] = (disagg_CTS_industry(
+            source, sector, use_nuts3code, no_self_gen=no_self_gen, year=year))
         # kepping only the data for the branches that are relevant
         usage = eev_clean.loc[ec.index]
         if disagg_ph:
@@ -480,8 +484,24 @@ def disagg_applications(source, sector, disagg_ph=False, use_nuts3code=False,
             print("Message: No disaggregation on temperature-levels has "
                   "been done, since there is no data for CTS-sector.")
     if sector == "industry":
-        ec = disagg_CTS_industry(source, sector, use_nuts3code, no_self_gen,
-                                 year=year)
+        [ec, f_sv_no_self_gen, f_gv_no_self_gen] = (
+            disagg_CTS_industry(source, sector, use_nuts3code,
+                                no_self_gen=no_self_gen, year=year))
+
+        # to separate gas consumption for industrial power plants (self gen)
+        # from rest of gas consumption
+        if ((no_self_gen is False) & (source == 'gas')):
+            # calculate factor of gas con for self gen
+            f_gv_self_gen = (1-f_gv_no_self_gen)
+            # multiply with overall gas consumption
+            ec_self_gen = ec.mul(f_gv_self_gen.loc[ec.index], axis=0)
+            # subtract gas con for self_gen
+            ec = ec - ec_self_gen
+            # create multiindex level for columns for later merging with
+            # disaggregated consumption by application
+            ec_self_gen_multi = pd.concat({'Industriekraftwerke': ec_self_gen},
+                                          names=['AWB'])
+
         # kepping only the data for the branches that are relevant
         usage = eev_clean.loc[ec.index]
         if disagg_ph:
@@ -524,57 +544,67 @@ def disagg_applications(source, sector, disagg_ph=False, use_nuts3code=False,
             percent = usage.loc[wz, app]
             new_df[wz, app] = ec[wz] * percent
 
+    # join gas con for self gen in industrial powerplants
+    if ((no_self_gen is False) & (source == 'gas') & (sector == 'industry')):
+        new_df = new_df.join(ec_self_gen_multi.reorder_levels([1, 0]).T)
+        total_sum = (ec.T + ec_self_gen).sum().sum()
+    else:
+        total_sum = ec.sum().sum()
+
     # Plausibility check:
+    disagg_sum = new_df.sum().sum()
     msg = ('The sum of consumptions (={:.3f}) and the sum of disaggrega'
            'ted consumptions (={:.3f}) do not match! Please check algorithm!')
-    total_sum = ec.sum().sum()
-    disagg_sum = new_df.sum().sum()
     assert np.isclose(total_sum, disagg_sum), msg.format(total_sum, disagg_sum)
-    return new_df
+    return new_df.sort_index(axis=1)
 
 
 def disagg_applications_eff(source, sector, disagg_ph=False,
-                            use_nuts3code=False, no_self_gen=False, **kwargs):
+                            use_nuts3code=False, no_self_gen=True, **kwargs):
     """
     
     Parameters
     ----------
-    source : TYPE
-        DESCRIPTION.
-    sector : TYPE
-        DESCRIPTION.
-    disagg_ph : TYPE, optional
-        DESCRIPTION. The default is False.
-    use_nuts3code : TYPE, optional
-        DESCRIPTION. The default is False.
-    no_self_gen : TYPE, optional
-        DESCRIPTION. The default is False.
-    **kwargs : TYPE
-        DESCRIPTION.
+    source : str
+        must be one of ['power', 'gas']
+    sector : str
+        must be one of ['CTS', 'industry']
+    disagg_ph : bool, default False
+        If True: returns industrial gas consumption fpr process heat by
+                 temperature level
+    use_nuts3code : bool, default False
+        throughput for
+        disagg_CTS_industry(
+                            use_nuts3code = False)
+        If True use NUTS-3 codes as region identifiers.
+    no_self_gen : bool, default False
+        throughput for
+        disagg_CTS_industry(
+                            no_self_gen=False)
+        If True: returns power and gas consumption without self
+                 generation, resulting energy consumption will be lower
 
     Returns
     -------
-    None.
-
+    pd.DataFrame with consumption values
+        columns: multiindex with level[0]=branch, level[1]=application
+        index: region-codes
     """
     # check if a year was specified
     cfg = kwargs.get('cfg', get_config())
     year = kwargs.get("year", cfg["base_year"])
     # call disagg_applications to get projected demand for given year
-    df_app = disagg_applications(source, sector, disagg_ph=False,
-                                 use_nuts3code=False, no_self_gen=False,
-                                 year=year)
+    df_app = disagg_applications(source, sector, disagg_ph, use_nuts3code,
+                                 no_self_gen=no_self_gen, year=year)
 
     # call efficiency function to get level of consumption reduction due to
     # efficiency advancements
     df_eff = efficiency_effect_app(source, sector, year=year)
 
-    # multiply consumption reduction due to efficiency gains with 
+    # multiply consumption reduction due to efficiency gains with
     df_app_eff = df_app.multiply(df_eff, level=1, axis=1)
 
     return df_app_eff
-    
-    
 
 # %% Utility functions
 
