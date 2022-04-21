@@ -8,8 +8,8 @@ Created on Tue Jan 25 17:39:43 2022
 from .spatial import disagg_applications
 from .config import (data_in, data_out, get_config, dict_region_code,
                      hist_weather_year, bl_dict, shift_profile_industry)
-from .data import (database_shapes, ambient_T, CTS_power_slp_generator,
-                   households_per_size, t_allo, shift_load_profile_generator,
+from .data import (database_shapes, ambient_T, t_allo,
+                   shift_load_profile_generator,
                    get_current_efficiency_level, gas_slp_weekday_params,
                    h_value, h_value_water)
 from .temporal import (disagg_temporal_gas_CTS_water, disagg_temporal_gas_CTS,
@@ -88,8 +88,8 @@ def sector_fuel_switch_fom_gas(sector, switch_to, **kwargs):
 def disagg_temporal_industry_fuel_switch(df_gas_switch,
                                          state=None, **kwargs):
     """
-    Temporally disaggregates industry gas demand, which will be switched by
-    state.
+    Temporally disaggregates industry gas demand, which will be switched to
+    electricity or hydrogen, by state.
 
     Parameters
     -------
@@ -152,7 +152,7 @@ def disagg_temporal_industry_fuel_switch(df_gas_switch,
 
     # get shift load profiles for given state
     sp_bl = shift_load_profile_generator(state, low, year=year)
-    
+
     # get normalized timeseries for temperature dependent gas demand for
     # industrial indoor heating, approximated with cts indor heat with gas SLP
     # 'KO'
@@ -199,7 +199,8 @@ def disagg_temporal_industry_fuel_switch(df_gas_switch,
 
 def disagg_temporal_cts_fuel_switch(df_gas_switch, state=None, **kwargs):
     """
-    Temporally disaggregates CTS gas demand, which will be switched, by state.
+    Temporally disaggregates CTS gas demand, which will be switched to
+    electricity or hydrogen, by state.
 
     Parameters
     -------
@@ -237,7 +238,7 @@ def disagg_temporal_cts_fuel_switch(df_gas_switch, state=None, **kwargs):
                   for i in df_gas_switch.index.astype(str)]
     nuts3_nuts1_dict = dict(zip(nuts3_list, nuts1_list))
 
-    # creat multicolumn from df_gas_switch columns and index
+    # create multicolumn from df_gas_switch columns and index
     # count how many different applications there are
     amount_application = len(df_gas_switch.columns.unique(level=1))
     # count how many different wz (industrial/commercial branches) there are
@@ -437,7 +438,7 @@ def temporal_industry_elec_load_from_fuel_switch(df_temp_gas_switch,
                          " must be 1")
     # get year from dataframe index
     year = df_temp_gas_switch.index[0].year
-    
+
     # create new DataFrame for results
     df_temp_elec_from_gas_switch = pd.DataFrame(index=df_temp_gas_switch.index,
                                                 columns=(df_temp_gas_switch
@@ -488,14 +489,37 @@ def temporal_industry_elec_load_from_fuel_switch(df_temp_gas_switch,
                                         .fillna(method='ffill')))
 
     # 3: get the COP timeseries for high temperature process heat
-    # --> T_sink=120°C, T_source=50°C delta_T=70°C
-    high_temp_hp_cop = cop_ts(source='waste heat', delta_t=70, year=year)
-    # select low tmeperature heat to be converted to electric demand with cop
+    # Use 2 heat pumps to reach this high temperature level
+    # 3.1: 1st stage: T_sink = 60°C
+    air_floor_cop, ground_floor_cop, water_floor_cop = cop_ts(sink_t=60,
+                                                              source='ambient',
+                                                              year=year)
+    # select heat demand to be converted to electric demand with cop
     df_hp_heat = (df_temp_gas_switch
                   .loc[:, col[:, :, ['Prozesswärme 100°C-200°C']]]
                   * get_current_efficiency_level())
-    df_temp_hp_medium_heat = (df_hp_heat.div(high_temp_hp_cop, level=0)
-                              .fillna(method='ffill'))
+    df_temp_hp_medium_heat_stage1 = (p_ground * (df_hp_heat
+                                                 .div(ground_floor_cop,
+                                                      level=0)
+                                                 .fillna(method='ffill'))
+                                     + p_air * (df_hp_heat
+                                                .div(air_floor_cop, level=0)
+                                                .fillna(method='ffill'))
+                                     + p_water * (df_hp_heat
+                                                  .div(water_floor_cop,
+                                                       level=0)
+                                                  .fillna(method='ffill')))
+    # 3.2: 2nd stage: use heat from first stage
+    # T_sink = 120°C, T_source = 60°C delta_T = 60°C
+    high_temp_hp_cop = cop_ts(source='waste heat', delta_t=60, year=year)
+    # select heat to be converted to electric demand with cop
+    df_temp_hp_medium_heat_stage2 = (df_hp_heat.div(high_temp_hp_cop, level=0)
+                                     .fillna(method='ffill'))
+    # add energy consumption of both stages
+    df_temp_hp_medium_heat = (df_temp_hp_medium_heat_stage1
+                              .add(df_temp_hp_medium_heat_stage2,
+                                   fill_value=0))
+
     # 4 get the COP timeseries for warm water  --> T=55°C
     air_floor_cop, ground_floor_cop, water_floor_cop = cop_ts(sink_t=55,
                                                               source='ambient',
@@ -504,11 +528,9 @@ def temporal_industry_elec_load_from_fuel_switch(df_temp_gas_switch,
     df_hp_heat = (df_temp_gas_switch
                   .loc[:, col[:, :, ['Warmwasser']]]
                   * get_current_efficiency_level())
-    df_temp_warm_water = (p_ground * (df_hp_heat.div(ground_floor_cop,
-                                                            level=0)
+    df_temp_warm_water = (p_ground * (df_hp_heat.div(ground_floor_cop, level=0)
                                       .fillna(method='ffill'))
-                          + p_air * (df_hp_heat.div(air_floor_cop,
-                                                           level=0)
+                          + p_air * (df_hp_heat.div(air_floor_cop, level=0)
                                      .fillna(method='ffill'))
                           + p_water * (df_hp_heat
                                        .div(water_floor_cop, level=0)
@@ -517,7 +539,7 @@ def temporal_industry_elec_load_from_fuel_switch(df_temp_gas_switch,
     df_mechanical_switch = ((df_temp_gas_switch
                             .loc[:, col[:, :, ['Mechanische \nEnergie']]])
                             * 0.4 / 0.85)  # TBD HACK! Update get_current_efficiency_level()
-    
+
     # add all dataframes together for electric demand per nuts3, branch and app
     df_temp_elec_from_gas_switch = (df_temp_elec_from_gas_switch
                                     .add(df_temp_hp_heating, fill_value=0)
@@ -542,7 +564,7 @@ def calculate_consumption_after_switch(df_old, df_switch, source):
         df_total = df_old.add(df_switch)
     else:
         df_total = df_old.sub(df_switch)
-        
+
     return df_total
 
 
@@ -816,8 +838,7 @@ def disagg_temporal_applications_hp(source, sector, detailed=False, state=None,
                     new_df[lk, branch, 'Raumwärme'] = ((df_app.loc[lk]
                                                        [branch, 'Raumwärme'])
                                                        * (hp_load_norm
-                                                          [str(lk),
-                                                           str(branch)]))
+                                                          [lk, branch]))
         else:  # HP load profile is not used
             # for every region
             for lk in new_df.columns.get_level_values(0).unique():
@@ -910,12 +931,6 @@ def create_hp_load(detailed=False, p_ground=0.36, p_air=0.58,
 
     # Creating COP timeseries
     air_floor_cop, ground_floor_cop, water_floor_cop = cop_ts(year=year)
-    # columns have to be cast to str, for matching with multicolumns in
-    # heat_norm DataFrame
-    if detailed:
-        air_floor_cop.columns = air_floor_cop.columns.astype(str)
-        ground_floor_cop.columns = ground_floor_cop.columns.astype(str)
-        water_floor_cop.columns = water_floor_cop.columns.astype(str)
 
     # compute electricity consumption timeseries for heat pumps with COP
     # respecting shares of HP technologies. el = heat/cop
@@ -1085,8 +1100,8 @@ def create_heat_norm_industry(state=None, slp='KO', **kwargs):
         hours = 8784
     else:
         hours = 8760
-        
-    ## make a dict with nuts3 as keys (lk) and nuts1 as values (bl)
+
+    # make a dict with nuts3 as keys (lk) and nuts1 as values (bl)
     nuts3_list = temperatur_df.columns
     nuts1_list = [bl_dict().get(int(i[: -3]))
                   for i in temperatur_df.columns.astype(str)]
@@ -1094,16 +1109,15 @@ def create_heat_norm_industry(state=None, slp='KO', **kwargs):
 
     # count how many different regions there are
     regions = [int(k) for k, v in nuts3_nuts1_dict.items() if v == state]
-    amount_regions = len(regions)
-    
+
     # new DataFrames for results
     gas_total = pd.DataFrame(columns=regions,
-                          index=pd.date_range((str(year) + '-01-01'),
-                                          periods=hours, freq='H'))
+                             index=pd.date_range((str(year) + '-01-01'),
+                                                 periods=hours, freq='H'))
     gas_temp_inde = pd.DataFrame(columns=regions,
-                          index=pd.date_range((str(year) + '-01-01'),
-                                          periods=hours, freq='H'))
-    
+                                 index=pd.date_range((str(year) + '-01-01'),
+                                                     periods=hours, freq='H'))
+
     # get weekday-factors per day
     F_wd = (gas_slp_weekday_params(state, year=year)
             .set_index('Date')['FW_'+str(slp)]).to_frame()
@@ -1112,13 +1126,13 @@ def create_heat_norm_industry(state=None, slp='KO', **kwargs):
     # get h-value for hot water per day
     h_slp_water = h_value_water(slp, [str(i) for i in regions],
                                 temperatur_df_clip)
-    
+
     # multiply h_values and week day values per day
     tw = pd.DataFrame(np.multiply(h_slp.values, F_wd.values),
-                          index=h_slp.index, columns=h_slp.columns.astype(int))
+                      index=h_slp.index, columns=h_slp.columns.astype(int))
     tw_water = pd.DataFrame(np.multiply(h_slp_water.values, F_wd.values),
-                          index=h_slp_water.index,
-                          columns=h_slp_water.columns.astype(int))
+                            index=h_slp_water.index,
+                            columns=h_slp_water.columns.astype(int))
 
     # normalize
     tw_norm = tw/tw.sum()
@@ -1129,7 +1143,7 @@ def create_heat_norm_industry(state=None, slp='KO', **kwargs):
     # multiply with gas demand per region
     ts_total = tw_norm.multiply(gv_lk_total.sum(axis=1).loc[regions])
     ts_water = tw_water_norm.multiply(gv_lk_tempinde.sum(axis=1).loc[regions])
-    
+
     # extend by one day because when resampling to hours later, this day
     # is lost otherwise
     last_day = ts_total.copy()[-1:]
@@ -1137,7 +1151,7 @@ def create_heat_norm_industry(state=None, slp='KO', **kwargs):
     ts_total = (ts_total.append(last_day).resample('H').pad()[:-1])
     # extend tw_water by one day and resample
     ts_water = (ts_water.append(last_day).resample('H').pad()[:-1])
-    
+
     # get temperature dataframe for hourly disaggregation
     t_allo_df = temperatur_df[[str(i) for i in regions]]
     for col in t_allo_df.columns:
@@ -1171,7 +1185,8 @@ def create_heat_norm_industry(state=None, slp='KO', **kwargs):
     temp_calender_df = (pd.concat([calender_df.reset_index(),
                                    t_allo_df.reset_index()], axis=1))
     temp_calender_water_df = (pd.concat([calender_df.reset_index(),
-                                   t_allo_water_df.reset_index()], axis=1))
+                                         t_allo_water_df.reset_index()],
+                                        axis=1))
     # add weekdays to calendar
     temp_calender_df['Tagestyp'] = 'MO'
     temp_calender_water_df['Tagestyp'] = 'MO'
@@ -1179,7 +1194,8 @@ def create_heat_norm_industry(state=None, slp='KO', **kwargs):
         (temp_calender_df.loc[temp_calender_df[typ], 'Tagestyp']) = typ
         (temp_calender_water_df
          .loc[temp_calender_water_df[typ], 'Tagestyp']) = typ
-    # get hourly percentages per slp and region, here only one slp is used    
+
+    # get hourly percentages per slp and region, here only one slp is used
     for lk in regions:
         # for calendar for gas total
         temp_cal = temp_calender_df.copy()
@@ -1195,7 +1211,7 @@ def create_heat_norm_industry(state=None, slp='KO', **kwargs):
         slp_profil = pd.read_excel(data_in('temporal',
                                            'Gas Load Profiles', f))
         slp_profil = pd.DataFrame(slp_profil.set_index(['Tagestyp',
-                                    'Temperatur\nin °C\nkleiner']))
+                                                'Temperatur\nin °C\nkleiner']))
         slp_profil.columns = pd.to_datetime(slp_profil.columns,
                                             format='%H:%M:%S')
         slp_profil.columns = pd.DatetimeIndex(slp_profil.columns).time
@@ -1203,7 +1219,7 @@ def create_heat_norm_industry(state=None, slp='KO', **kwargs):
         temp_cal['Prozent'] = [slp_profil[x] for x in temp_cal.index]
         # multiplication of gas demand with hourly factors
         gas_total[int(lk)] = (ts_total[lk].values
-                           * temp_cal['Prozent'].values/100)
+                              * temp_cal['Prozent'].values/100)
         # for calendar for calendar gas temp independent
         temp_cal = temp_calender_water_df.copy()
         temp_cal = temp_cal[['Date', 'Tagestyp', str(lk)]].set_index("Date")
@@ -1218,7 +1234,7 @@ def create_heat_norm_industry(state=None, slp='KO', **kwargs):
         slp_profil = pd.read_excel(data_in('temporal',
                                            'Gas Load Profiles', f))
         slp_profil = pd.DataFrame(slp_profil.set_index(['Tagestyp',
-                                    'Temperatur\nin °C\nkleiner']))
+                                                'Temperatur\nin °C\nkleiner']))
         slp_profil.columns = pd.to_datetime(slp_profil.columns,
                                             format='%H:%M:%S')
         slp_profil.columns = pd.DatetimeIndex(slp_profil.columns).time
@@ -1321,8 +1337,14 @@ def cop_ts(sink_t=40, source='ambient', delta_t=None, **kwargs):
         ground_floor_cop = cop_curve((sink_t - ground_t), 'ground')
         water_floor_cop = cop_curve((sink_t - water_t), 'water')
 
+        # change columns to int
+        air_floor_cop.columns = air_floor_cop.columns.astype(int)
+        ground_floor_cop.columns = ground_floor_cop.columns.astype(int)
+        water_floor_cop.columns = water_floor_cop.columns.astype(int)
+
         return air_floor_cop, ground_floor_cop, water_floor_cop
 
+    # if source == 'waste heat' 
     else:
         assert isinstance(delta_t, (int, float)), ("'delta_t' needs to be a "
                                                    "number.")
@@ -1336,6 +1358,8 @@ def cop_ts(sink_t=40, source='ambient', delta_t=None, **kwargs):
         #  the art, research Status, refrigerants, and application potentials",
         # Energy, 2018
         high_temp_hp_cop = 68.455*(delta_t.pow(-0.76))
+        
+        high_temp_hp_cop.columns = high_temp_hp_cop.columns.astype(int)
 
         return high_temp_hp_cop
 
@@ -1361,8 +1385,8 @@ def projection_fuel_switch_share(df_fuel_switch, target_year):
     """
     if target_year <= date.today().year:
         logger.info('Target year is lower than current year. No projection is'
-                    ' done. Target year:' + str(target_year) + ' and Current'
-                    ' year: ' + str(date.today().year))
+                    ' done. Target year:' + str(target_year) + ' and base'
+                    ' year: ' + str(2015))
         # as there is no projection the share of fuel which is switched away
         # from is 0.
         for col in df_fuel_switch.columns:
@@ -1371,7 +1395,7 @@ def projection_fuel_switch_share(df_fuel_switch, target_year):
         return df_fuel_switch
     else:
         # define current year
-        start_year = int(date.today().year)
+        start_year = int(2015)
         # define yearly step from today to 2045
         df_scaling = df_fuel_switch.div(2045-start_year)
         # project to target year
