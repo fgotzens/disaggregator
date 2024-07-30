@@ -29,6 +29,8 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import matplotlib.patheffects as PathEffects
 from matplotlib.colors import LinearSegmentedColormap
+import matplotlib.colors as colors
+
 from .config import get_config
 from .data import database_shapes, transpose_spatiotemporal
 logger = logging.getLogger(__name__)
@@ -42,7 +44,7 @@ def choropleth_map(df, cmap=None, interval=None, annotate=None,
                    annotate_zeros=False, relative=True,
                    colorbar_each_subplot=False, hide_colorbar=False,
                    add_percentages=False, license_tag=True,
-                   background=True, **kwargs):
+                   background=True, delta=False, **kwargs):
     """
     Plot a choropleth map* for each column of data in passed df.
 
@@ -88,7 +90,7 @@ def choropleth_map(df, cmap=None, interval=None, annotate=None,
     suptitle = kwargs.get('suptitle', None)
     axtitle = kwargs.get('axtitle', '')
     unit = kwargs.get('unit', '-')
-    fontsize = kwargs.get('fontsize', 12)
+    fontsize = kwargs.get('fontsize', 9)
     fontsize_an = kwargs.get('fontsize', 6)
     sep = kwargs.get('sep', '\n')
     color = kwargs.get('color', 'black')
@@ -101,6 +103,7 @@ def choropleth_map(df, cmap=None, interval=None, annotate=None,
     extend = kwargs.get('extend', 'neither')
     mode = kwargs.get('mode', 'a4screen')
     plt.rcParams.update({'font.size': fontsize})
+    lw = kwargs.get('linewidth', 1)
 
     if shape_source_api:
         # Perform request through RestfulAPI
@@ -208,23 +211,29 @@ def choropleth_map(df, cmap=None, interval=None, annotate=None,
         if background:
             DE.plot(ax=ax[i, j], color=bgcolor, edgecolor=bgedgecolor)
         # Second layer: make subplot
-        (DF.dropna(subset=[col], axis=0)
-           .plot(ax=ax[i, j], column=col, cmap=cmap[a], edgecolor=edgecolor,
-                 vmin=intervals[a][0], vmax=intervals[a][1]))
+        if delta:
+            divnorm=colors.TwoSlopeNorm(vmin=intervals[a][0], vcenter=0., vmax=intervals[a][1])
+            (DF.dropna(subset=[col], axis=0)
+               .plot(ax=ax[i, j], column=col, cmap=cmap[a], edgecolor=edgecolor,
+                     norm=divnorm, linewidth=lw))
+        else:
+            (DF.dropna(subset=[col], axis=0)
+               .plot(ax=ax[i, j], column=col, cmap=cmap[a], edgecolor=edgecolor,
+                     vmin=intervals[a][0], vmax=intervals[a][1], linewidth=lw))
         if not shape_source_api:
             ax[i, j].set_xlim(5.5, 15.3)
             ax[i, j].set_ylim(47.0, 55.3)
         # Deal with axes titles
         if isinstance(axtitle, str):
             if len(cols) == 1:
-                ax[i, j].set_title('{}'.format(axtitle))
+                ax[i, j].set_title('{}'.format(axtitle), fontsize=fontsize)
             else:
                 if add_percentages:
                     ratio = '{:.1f}'.format(df[col].sum()/df.sum().sum()*100.)
                     ax[i, j].set_title('{} {} ({}%)'.format(axtitle, col,
-                                                            ratio))
+                                                            ratio), fontsize=fontsize)
                 else:
-                    ax[i, j].set_title('{} {}'.format(axtitle, col))
+                    ax[i, j].set_title('{} {}'.format(axtitle, col), fontsize=fontsize)
         ax[i, j].get_xaxis().set_visible(False)
         ax[i, j].get_yaxis().set_visible(False)
 
@@ -289,25 +298,43 @@ def choropleth_map(df, cmap=None, interval=None, annotate=None,
             for a, axes in enumerate(ax.ravel().tolist()):
                 if a >= len(cols):
                     break  # To deal with possibly deactivated remaining axes
-
-                sm = ScaMap(cmap=cmap[a],
+                    
+                if delta:
+                    sm = ScaMap(cmap=cmap[a],
+                            norm=divnorm)
+                    #ticks=np.linspace(intervals[a][0], intervals[a][1],3, endpoint=True)
+                    # ticks=[round(intervals[a][0]), round(intervals[a][0]/2), 0., round(intervals[a][1]/2), round(intervals[a][1])]
+                    ticks=[int(intervals[a][0]), int(intervals[a][0]/2), 0., int(intervals[a][1]/2), int(intervals[a][1])]
+                
+                else:
+                    sm = ScaMap(cmap=cmap[a],
                             norm=plt.Normalize(vmin=intervals[a][0],
-                                               vmax=intervals[a][1]))
+                                                vmax=intervals[a][1]))
+                            # norm=plt.colors.LogNorm(vmin=intervals[a][0],
+                            #                         vmax=intervals[a][1]))
                 sm._A = []
                 divider = make_axes_locatable(axes)
                 cax = divider.append_axes("bottom", size="5%", pad=0.05)
-                cbar = fig.colorbar(
+                if delta:
+                    cbar = fig.colorbar(
                     sm, cax=cax, shrink=1.0, pad=0.01, fraction=0.046,
-                    orientation='horizontal', anchor=(0.5, 1.0),
-                    format=mticker.StrMethodFormatter('{x:,g}'),
+                    orientation='horizontal', anchor=(0.5, 1.0), 
+                    ticks=ticks, format=mticker.StrMethodFormatter('{x:,g}'),
                     extend=extend)
+                else:
+                    cbar = fig.colorbar(sm, cax=cax, shrink=1.0, pad=0.01, fraction=0.046,
+                                        orientation='horizontal', anchor=(0.5, 1.0),
+                                        format=mticker.StrMethodFormatter('{x:,g}'),
+                                        extend=extend)
                 cbar.set_label(units[a])
             if len(cols) > 1:
                 fig.tight_layout()
         else:
             sm = ScaMap(cmap=cmap[0],
                         norm=plt.Normalize(vmin=intervals[0][0],
-                                           vmax=intervals[0][1]))
+                                            vmax=intervals[0][1]))
+                        # norm=colors.LogNorm(vmin=intervals[a][0],
+                        #                             vmax=intervals[a][1]))
             sm._A = []
             shr = 1.0 if ncols <= 2 else 0.5
             cbar = fig.colorbar(
@@ -342,19 +369,33 @@ def heatmap_timeseries(df, **kwargs):
     cmap = kwargs.get('cmap', 'viridis')
     vmin = kwargs.get('vmin', df.min().min())
     vmax = kwargs.get('vmax', df.max().max())
+    fs = kwargs.get('fontsize', 9)
+    sharex = kwargs.get('sharex', True)
+    plt.rcParams.update({'font.size': fs})
+    
     hours = 24
     days = int(len(df) / hours)
     i, j = [0, 0]
 
-    fig, ax = plt.subplots(figsize=figsize, nrows=nrows, ncols=1, sharex=True,
-                           squeeze=False)
+    fig, ax = plt.subplots(figsize=figsize, nrows=nrows, ncols=1,
+                           sharex=sharex, squeeze=False)
     for col, ser in df.iteritems():
         dfs = pd.DataFrame(np.array(ser).reshape(days, hours)).T
+        # test = pd.DataFrame(index=pd.to_datetime(dfs.index, format="%H").time).index.astype(str)
+        # newtest = [x[:-3] for x in test]
+        # dfs.index=newtest
+        # dfs.index=pd.to_datetime(dfs.index, format="%H").time
         cax = ax[i, j].imshow(dfs, interpolation='nearest', cmap=cmap,
                               vmin=vmin, vmax=vmax)
         ax[i, j].set_aspect('auto')
         ax[i, j].set_title(col)
-        ax[i, j].set_ylabel('Stunde')
+        ax[i, j].set_ylabel('Uhrzeit')
+
+        ax[i, j].set_yticklabels(labels=dfs.index.astype(str).values)
+        ax[i, j].set_yticklabels(labels=['00:00', '00:00', '10:00',
+                                         '20:00'])
+
+        
         if i == nrows - 1:
             ax[i, j].set_xlabel('Tag des Jahres')
         i += 1
@@ -362,12 +403,110 @@ def heatmap_timeseries(df, **kwargs):
     fig.tight_layout()
     fig.subplots_adjust(right=0.8)
     #  Dimensions [left, bottom, width, height] of the new axes
-    ax_cbar = fig.add_axes([0.85, 0.05, 0.03, 0.90])
-    cbar = plt.colorbar(cax, cax=ax_cbar)
+    # ax_cbar = fig.add_axes([0.85, 0.05, 0.03, 0.90])
+    ax_cbar = fig.add_axes([0.25, -0.03, 0.4, 0.05])
+
+    cbar = plt.colorbar(cax, cax=ax_cbar, orientation='horizontal')
     cbar.set_label(clabel)
-    add_license_to_figure(fig, into_ax=False)
+    #add_license_to_figure(fig, into_ax=False)
     return fig, ax
 
+
+def heatmap_timeseries_ax(df, ax1, ax2, **kwargs):
+    """
+    Plot a heatmap for a given time series df.
+    """
+    plt.style.use(['science', 'no-latex'])
+    
+    if isinstance(df, pd.Series):
+        df = df.to_frame()
+    if not isinstance(df, pd.DataFrame):
+        raise ValueError("Please pass a DateTimeIndex'ed pd.DataFrame or "
+                         "pd.Series.")
+
+    nrows = len(df.columns)
+    clabel = kwargs.get('clabel', '')
+    figsize = kwargs.get('figsize', (12, 3*nrows))
+    cmap = kwargs.get('cmap', 'viridis')
+    vmin = kwargs.get('vmin', df.min().min())
+    vmax = kwargs.get('vmax', df.max().max())
+    fs = kwargs.get('fontsize', 9)
+    plt.rcParams.update({'font.size': fs})
+    # ax = ax
+
+    hours = 24
+    days = int(len(df) / hours)
+    i, j = [0, 0]
+
+    # fig, ax = plt.subplots(figsize=figsize, nrows=nrows, ncols=1, sharex=True,
+    #                        squeeze=False)
+    for col, ser in df.iteritems():
+        dfs = pd.DataFrame(np.array(ser).reshape(days, hours)).T
+        cax = ax1.imshow(dfs, interpolation='nearest', cmap=cmap,
+                               vmin=vmin, vmax=vmax)
+        # ax.set_aspect('auto')
+        # ax.set_title(col)
+        # ax.set_ylabel('Stunde')
+        # ax.set_xlabel('Tag des Jahres')
+
+
+    # fig.tight_layout()
+    # fig.subplots_adjust(right=0.8)
+    # #  Dimensions [left, bottom, width, height] of the new axes
+    # ax_cbar = fig.add_axes([0.85, 0.05, 0.03, 0.90])
+    cbar = plt.colorbar(cax, cax=ax2, orientation="horizontal")
+    cbar.set_label(clabel)
+    #add_license_to_figure(fig, into_ax=False)
+    return cax, cbar
+
+
+def heatmap_timeseries_single_ax(df, ax1, **kwargs):
+    """
+    Plot a heatmap for a given time series df.
+    """
+    plt.style.use(['science', 'no-latex'])
+    
+    if isinstance(df, pd.Series):
+        df = df.to_frame()
+    if not isinstance(df, pd.DataFrame):
+        raise ValueError("Please pass a DateTimeIndex'ed pd.DataFrame or "
+                         "pd.Series.")
+
+    nrows = len(df.columns)
+    clabel = kwargs.get('clabel', '')
+    figsize = kwargs.get('figsize', (12, 3*nrows))
+    cmap = kwargs.get('cmap', 'viridis')
+    vmin = kwargs.get('vmin', df.min().min())
+    vmax = kwargs.get('vmax', df.max().max())
+    fs = kwargs.get('fontsize', 9)
+    plt.rcParams.update({'font.size': fs})
+    # ax = ax
+
+    hours = 24
+    days = int(len(df) / hours)
+    i, j = [0, 0]
+
+    # fig, ax = plt.subplots(figsize=figsize, nrows=nrows, ncols=1, sharex=True,
+    #                        squeeze=False)
+    for col, ser in df.iteritems():
+        dfs = pd.DataFrame(np.array(ser).reshape(days, hours)).T
+        cax = ax1.imshow(dfs, interpolation='nearest', cmap=cmap,
+                               vmin=vmin, vmax=vmax)
+        # ax.set_aspect('auto')
+        # ax.set_title(col)
+        # ax.set_ylabel('Stunde')
+        # ax.set_xlabel('Tag des Jahres')
+
+
+    # fig.tight_layout()
+    # fig.subplots_adjust(right=0.8)
+    # #  Dimensions [left, bottom, width, height] of the new axes
+    
+    # ax_cbar = fig.add_axes([0.25, -0.03, 0.4, 0.05])
+    # cbar = plt.colorbar(cax, cax=ax_cbar, orientation="horizontal")
+    # cbar.set_label(clabel)
+    #add_license_to_figure(fig, into_ax=False)
+    return cax
 
 def multireg_generic(df, **kwargs):
     """
@@ -573,10 +712,10 @@ def set_ax_format(ax, axtitle=None, axtitlesize=None, axtitlebold=False,
     if axtitle is not None:
         weight = 'bold' if axtitlebold else 'normal'
         if axtitlesize is None:
-            ax.set_title(axtitle, size=plt.rcParams['font.size']+2,
+            ax.set_title(axtitle, size=plt.rcParams['font.size'], # +2
                          weight=weight)
         else:
-            ax.set_title(axtitle, size=plt.rcParams['font.size']+axtitlesize,
+            ax.set_title(axtitle, size=plt.rcParams['font.size'], # +axtitlesize
                          weight=weight)
     # xlabel
     if xlabel is not None and xlabel_visible:

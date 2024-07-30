@@ -32,7 +32,8 @@ from .data import (elc_consumption_HH, households_per_size, population,
                    shift_load_profile_generator, gas_slp_weekday_params,
                    percentage_EFH_MFH, regional_branch_load_profiles)
 from .spatial import (disagg_CTS_industry, disagg_households_power,
-                      disagg_households_gas, disagg_applications)
+                      disagg_households_gas, disagg_applications,
+                      disagg_applications_eff)
 # from .heat import (create_hp_load)  ## TBD: fix that import error
 from datetime import timedelta
 import numpy as np
@@ -40,6 +41,7 @@ import pandas as pd
 import xarray as xr
 import geopandas as gpd
 import logging
+import os
 logger = logging.getLogger(__name__)
 
 
@@ -302,8 +304,9 @@ def create_projection(df, target_year, by, **kwargs):
 
 
 def disagg_temporal_applications(source, sector, detailed=False,
-                                     state=None, use_nuts3code=False,
-                                     disagg_ph=False, use_blp=False, **kwargs):
+                                 state=None, use_nuts3code=False,
+                                 disagg_ph=False, use_blp=False,
+                                 use_slp_for_sh=False, **kwargs):
     """
     Perform dissagregation based on applications of the final energy usage
 
@@ -330,6 +333,9 @@ def disagg_temporal_applications(source, sector, detailed=False,
     use_blp: bool, default False
         If True, branch load profiles (blp) are used if available. blp are
         based on measured consumption data gathered during DemandRegio project.
+    use_slp_for_sh: bool, default False
+        If True, SLP of 'KO' is used to model space heating in gas industry
+        demand
 
     Returns
     -------
@@ -347,12 +353,12 @@ def disagg_temporal_applications(source, sector, detailed=False,
     cfg = kwargs.get('cfg', get_config())
     year = kwargs.get("year", cfg["base_year"])
     # troughput values for the helper function, used for industrial disagg
-    low = kwargs.get("low", 0.4)
+    low = kwargs.get("low", 0.5)
     no_self_gen = kwargs.get("no_self_gen", False)
 
     # perfom spatial disagg of demand per consumer group and application
-    df_app = disagg_applications(source, sector, disagg_ph,
-                                 use_nuts3code, no_self_gen, year=year)
+    df_app = disagg_applications_eff(source, sector, disagg_ph,
+                                     use_nuts3code, no_self_gen, year=year)
     # count how many different applications there are
     amount_application = len(df_app.columns.unique(level=1))
     # count how many different wz (industrial/commercial branches) there are
@@ -396,7 +402,7 @@ def disagg_temporal_applications(source, sector, detailed=False,
         index = pd.MultiIndex.from_tuples(tuples, names=["LK", "Anwendung"])
 
         # new df with multiindex columns and datetime as index
-        new_df = pd.DataFrame(columns=index, index=ec.index)
+        new_df = pd.DataFrame(columns=index, index=ec.index, dtype='float')
 
         # print info on the process
         logger.info("Working on disaggregating the applications for each "
@@ -404,13 +410,55 @@ def disagg_temporal_applications(source, sector, detailed=False,
 
         # percentage-values from the averages of the spatial disagg function
         # by region and application to use for multiplication
-        percentages = (df_app.mean(level=1, axis=1)
-                       .div(df_app.mean(level=1, axis=1).sum(axis=1), axis=0))
+        percentages = (df_app.groupby(level=1, axis=1).mean()
+                       .div(df_app.groupby(level=1, axis=1).mean().sum(axis=1),
+                            axis=0))
         # for every lk multiply the consumption with the percentual use for
         # that application
         for lk in ec.columns:
             for app in df_app.columns.unique(level=1):
                 new_df[lk, app] = percentages.loc[lk, app] * ec[lk]
+
+        # when finished, use slp 'KO' for heat demand if sector ='industry'
+        if use_slp_for_sh:
+            assert(sector == 'industry' and source == 'gas')
+            col = pd.IndexSlice
+            nuts3_list = ec.columns
+            nuts1_list = [bl_dict().get(int(i[: -3]))
+                          for i in ec.columns.astype(str)]
+            nuts3_nuts1_dict = dict(zip(nuts3_list, nuts1_list))
+            temp_df = t_allo(year=year)
+            gv_lk = (disagg_applications_eff(source="gas", sector="industry",
+                                         use_nuts3code=False, year=year))
+
+            for state in ['SH', 'HH', 'NI', 'HB', 'NW', 'HE', 'RP', 'BW', 'BY',
+                          'SL', 'BE', 'BB', 'MV', 'SN', 'ST', 'TH']:
+                regions = [int(k) for k, v in nuts3_nuts1_dict.items()
+                           if v == state]
+                heat_norm = create_heat_norm_industry(state=state,
+                                                      year=year,
+                                                      df_gv_lk=gv_lk,
+                                                      temp_df=temp_df)[0]
+                # resample to 15 minutes
+                heat_norm = (heat_norm.resample('15T')
+                             .interpolate(method='linear'))
+                # extend DataFrame by 3 more periods, because it would be
+                # too short otherwise
+                extension = pd.DataFrame(index=pd.date_range(
+                    heat_norm.index[-1:].values[0], periods=4,
+                    freq='15T')[-3:], columns=heat_norm.columns)
+                heat_norm = (heat_norm.append(extension)
+                             .fillna(method='ffill'))
+                # normalise
+                heat_norm = heat_norm.divide(heat_norm.sum(axis=0), axis=1)
+
+                # save gas demand for space heating
+                gd_region_sh = new_df.loc[:, col[regions, ['Raumwärme']]].sum()
+                # calculate timeseries from gas demand
+                gd_region_sh_ts = heat_norm.multiply(gd_region_sh.values)
+                gd_region_sh_ts.columns = gd_region_sh.index
+
+                new_df.loc[:, col[regions, ['Raumwärme']]] = gd_region_sh_ts
 
     else:  # results will be "detailed"
         assert state in list(bl_dict().values()), ("'state' needs to be in "
@@ -470,14 +518,12 @@ def disagg_temporal_applications(source, sector, detailed=False,
                                                            "Anwendungen"])
 
         # new df with multiindex columns and datetime as index
-        new_df = pd.DataFrame(columns=columns, index=ec.index)
-        # optional, give memory usage info
-		# logger.info('Approximate memory usage of Dataframe in MB will be: '
-        #           + str(new_df.memory_usage(deep=True).sum()/1000000))
+        new_df = pd.DataFrame(columns=columns, index=ec.index, dtype='float')
 
         # percentage-values from the averages of the spatial disagg function
-        # by region, industrial branch and application to use for multiplication
-        percentages = (df_app.div(df_app.sum(axis=1, level=0), level=0).mean())
+        # by region,industrial branch and application to use for multiplication
+        percentages = (df_app.div(df_app.groupby(level=0, axis=1).sum(),
+                                  level=0).mean())
 
         i = 1  # lk counter
         # for every lk and WZ multiply the consumption with the percentual
@@ -493,6 +539,46 @@ def disagg_temporal_applications(source, sector, detailed=False,
                 for app in new_df.columns.get_level_values(2).unique():
                     new_df[lk, branch, app] = (percentages.loc[branch, app]
                                                * ec[lk, branch])
+
+        # when finished, use slp 'KO' for heat demand if sector ='industry'
+        if use_slp_for_sh:
+            assert(sector == 'industry' and source == 'gas')
+            col = pd.IndexSlice
+            heat_norm = create_heat_norm_industry(state=state,
+                                                  year=year)[0]
+            # resample to 15 minutes
+            heat_norm = (heat_norm.resample('15T')
+                         .interpolate(method='linear'))
+            # extend DataFrame by 3 more periods, because it would be
+            # too short otherwise
+            extension = pd.DataFrame(index=pd.date_range(
+                heat_norm.index[-1:].values[0], periods=4,
+                freq='15T')[-3:], columns=heat_norm.columns)
+            heat_norm = (heat_norm.append(extension)
+                         .fillna(method='ffill'))
+            # normalise
+            heat_norm = heat_norm.divide(heat_norm.sum(axis=0), axis=1)
+
+            # # save gas demand for space heating
+            # gd_region_sh = new_df.loc[:, col[:, :, ['Raumwärme']]].sum()
+            # # calculate timeseries from gas demand
+            # gd_region_sh_ts = pd.DataFrame(data=((gd_region_sh.values)
+            #                                      * (heat_norm.values)),
+            #                                index=new_df.index,
+            #                                columns=gd_region_sh.index)
+            # (gd_region_sh[13003].values)*(heat_norm[13003].values)
+            # # set new space heating timeseries instead of old one
+
+            gd_regio_sh = new_df.loc[:, col[:, :, ['Raumwärme']]]
+
+            gd_regio_sh_sum = gd_regio_sh.sum()
+            for lk in gd_regio_sh.columns.get_level_values(0):
+                gd_regio_sh.loc[:][lk] = pd.DataFrame(
+                    data=(np.outer(heat_norm[lk].values,
+                                   gd_regio_sh_sum[lk].values)),
+                    columns=gd_regio_sh[lk].columns, index=heat_norm.index)
+
+            new_df.loc[:, col[:, :, ['Raumwärme']]] = gd_regio_sh
 
     # Plausibility check:
     msg = ('The sum of consumptions (={:.3f}) and the sum of disaggrega'
@@ -514,6 +600,260 @@ def disagg_temporal_applications(source, sector, detailed=False,
 
 
 # %% Utility functions
+
+
+def create_heat_norm_industry(state=None, slp='KO', df_gv_lk=None,
+                              temp_df=None, **kwargs):
+    """
+    Creates normalised heat demand timeseries for CTS per NUTS-3, and branch
+    if detailed is set to True.
+
+    Parameters
+    ----------
+    detailed : bool, default False
+        If True heat demand per branch and disctrict is calculated.
+        Otherwise just the heat demand per district.
+    state : str, default None
+        Specifies state. Only needed if detailed=True. Must by one of the
+        entries of bl_dict().values(),
+        ['SH', 'HH', 'NI', 'HB', 'NW', 'HE', 'RP', 'BW', 'BY', 'SL', 'BE',
+         'BB', 'MV', 'SN', 'ST', 'TH']
+    slp : str, default "KO"
+        musst be one of ['BD', 'BH', 'GA', 'GB', 'HA', 'KO', 'MF', 'MK', 'PD']
+
+    Returns
+    -------
+
+    """
+    # get base year
+    cfg = kwargs.get('cfg', get_config())
+    year = kwargs.get('year', cfg['base_year'])
+    # Idea: create normalized heat profile from gas SLP for offices but use
+    # industry consumption
+    if df_gv_lk is None:
+        gv_lk = (disagg_applications_eff(source="gas", sector="industry",
+                                         use_nuts3code=False, year=year))
+    else:
+        gv_lk = df_gv_lk
+
+    col = pd.IndexSlice
+    gv_lk_total = gv_lk.copy()
+    gv_lk_tempinde = gv_lk.loc[:, col[:, ['Warmwasser',
+                                          'Mechanische Energie',
+                                          'Prozesswärme']]]
+
+    # get daily allocation temperature
+    if temp_df is None:
+        temperatur_df = t_allo(year=year)
+    else:
+        temperatur_df = temp_df
+    # clip at 15 for hot water, below 15°C the water heating demand is assumed
+    # to be constant
+    temperatur_df_clip = temperatur_df.clip(15)
+    # check if gap year
+    if ((year % 4 == 0) & (year % 100 != 0) | (year % 4 == 0)
+            & (year % 100 == 0) & (year % 400 == 0)):
+        hours = 8784
+    else:
+        hours = 8760
+
+    # make a dict with nuts3 as keys (lk) and nuts1 as values (bl)
+    nuts3_list = temperatur_df.columns
+    nuts1_list = [bl_dict().get(int(i[: -3]))
+                  for i in temperatur_df.columns.astype(str)]
+    nuts3_nuts1_dict = dict(zip(nuts3_list, nuts1_list))
+
+    # count how many different regions there are
+    regions = [int(k) for k, v in nuts3_nuts1_dict.items() if v == state]
+
+    # new DataFrames for results
+    gas_total = pd.DataFrame(columns=regions,
+                             index=pd.date_range((str(year) + '-01-01'),
+                                                 periods=hours, freq='H'),
+                             dtype='float')
+    gas_temp_inde = pd.DataFrame(columns=regions,
+                                 index=pd.date_range((str(year) + '-01-01'),
+                                                     periods=hours, freq='H'),
+                                 dtype='float')
+
+    # get weekday-factors per day
+    F_wd = (gas_slp_weekday_params(state, year=year)
+            .set_index('Date')['FW_'+str(slp)]).to_frame()
+    # get h-value per day
+    h_slp = h_value(slp, [str(i) for i in regions], temperatur_df)
+    # get h-value for hot water per day
+    h_slp_water = h_value_water(slp, [str(i) for i in regions],
+                                temperatur_df_clip)
+
+    # multiply h_values and week day values per day
+    tw = pd.DataFrame(np.multiply(h_slp.values, F_wd.values),
+                      index=h_slp.index, columns=h_slp.columns.astype(int))
+    tw_water = pd.DataFrame(np.multiply(h_slp_water.values, F_wd.values),
+                            index=h_slp_water.index,
+                            columns=h_slp_water.columns.astype(int))
+
+    # normalize
+    tw_norm = tw/tw.sum()
+    tw_water_norm = tw_water/tw_water.sum()
+    # set DatetimeIndex
+    tw_norm.index = pd.DatetimeIndex(tw_norm.index)
+    tw_water_norm.index = pd.DatetimeIndex(tw_water_norm.index)
+    # multiply with gas demand per region
+    ts_total = tw_norm.multiply(gv_lk_total.sum(axis=1).loc[regions])
+    ts_water = tw_water_norm.multiply(gv_lk_tempinde.sum(axis=1).loc[regions])
+
+    # extend by one day because when resampling to hours later, this day
+    # is lost otherwise
+    last_day = ts_total.copy()[-1:]
+    last_day.index = last_day.index + timedelta(1)
+    ts_total = (ts_total.append(last_day).resample('H').pad()[:-1])
+    # extend tw_water by one day and resample
+    ts_water = (ts_water.append(last_day).resample('H').pad()[:-1])
+
+    # get temperature dataframe for hourly disaggregation
+    t_allo_df = temperatur_df[[str(i) for i in regions]]
+    for col in t_allo_df.columns:
+        t_allo_df[col].values[t_allo_df[col].values < -15] = -15
+        t_allo_df[col].values[(t_allo_df[col].values > -15)
+                              & (t_allo_df[col].values < -10)] = -10
+        t_allo_df[col].values[(t_allo_df[col].values > -10)
+                              & (t_allo_df[col].values < -5)] = -5
+        t_allo_df[col].values[(t_allo_df[col].values > -5)
+                              & (t_allo_df[col].values < 0)] = 0
+        t_allo_df[col].values[(t_allo_df[col].values > 0)
+                              & (t_allo_df[col].values < 5)] = 5
+        t_allo_df[col].values[(t_allo_df[col].values > 5)
+                              & (t_allo_df[col].values < 10)] = 10
+        t_allo_df[col].values[(t_allo_df[col].values > 10)
+                              & (t_allo_df[col].values < 15)] = 15
+        t_allo_df[col].values[(t_allo_df[col].values > 15)
+                              & (t_allo_df[col].values < 20)] = 20
+        t_allo_df[col].values[(t_allo_df[col].values > 20)
+                              & (t_allo_df[col].values < 25)] = 25
+        t_allo_df[col].values[(t_allo_df[col].values > 25)] = 100
+        t_allo_df = t_allo_df.astype('int32')
+    # for tempindependent consumption of ts_water t_allo_df = 100
+    t_allo_water_df = t_allo_df.copy()
+    t_allo_water_df.values[:] = 100
+
+    # rewrite calendar for better data handling later
+    calender_df = (gas_slp_weekday_params(state, year=year)
+                   [['Date', 'MO', 'DI', 'MI', 'DO', 'FR', 'SA', 'SO']])
+    # add temperature data to calendar
+    temp_calender_df = (pd.concat([calender_df.reset_index(),
+                                   t_allo_df.reset_index()], axis=1))
+    temp_calender_water_df = (pd.concat([calender_df.reset_index(),
+                                         t_allo_water_df.reset_index()],
+                                        axis=1))
+    # add weekdays to calendar
+    temp_calender_df['Tagestyp'] = 'MO'
+    temp_calender_water_df['Tagestyp'] = 'MO'
+    for typ in ['DI', 'MI', 'DO', 'FR', 'SA', 'SO']:
+        (temp_calender_df.loc[temp_calender_df[typ], 'Tagestyp']) = typ
+        (temp_calender_water_df
+         .loc[temp_calender_water_df[typ], 'Tagestyp']) = typ
+
+    # get hourly percentages per slp and region, here only one slp is used
+    for lk in regions:
+        # for calendar for gas total
+        temp_cal = temp_calender_df.copy()
+        temp_cal = temp_cal[['Date', 'Tagestyp', str(lk)]].set_index("Date")
+        last_hour = temp_cal.copy()[-1:]
+        last_hour.index = last_hour.index + timedelta(1)
+        temp_cal = temp_cal.append(last_hour)
+        temp_cal = temp_cal.resample('H').pad()
+        temp_cal = temp_cal[:-1]
+        temp_cal['Stunde'] = pd.DatetimeIndex(temp_cal.index).time
+        temp_cal = temp_cal.set_index(["Tagestyp", str(lk), 'Stunde'])
+        f = ('Lastprofil_{}.xls'.format(slp))
+        slp_profil = pd.read_excel(data_in('temporal',
+                                           'Gas Load Profiles', f))
+        slp_profil = pd.DataFrame(slp_profil.set_index(['Tagestyp',
+                                                'Temperatur\nin °C\nkleiner']))
+        slp_profil.columns = pd.to_datetime(slp_profil.columns,
+                                            format='%H:%M:%S')
+        slp_profil.columns = pd.DatetimeIndex(slp_profil.columns).time
+        slp_profil = slp_profil.stack()
+        temp_cal['Prozent'] = [slp_profil[x] for x in temp_cal.index]
+        # multiplication of gas demand with hourly factors
+        gas_total[int(lk)] = (ts_total[lk].values
+                              * temp_cal['Prozent'].values/100)
+        # for calendar for calendar gas temp independent
+        temp_cal = temp_calender_water_df.copy()
+        temp_cal = temp_cal[['Date', 'Tagestyp', str(lk)]].set_index("Date")
+        last_hour = temp_cal.copy()[-1:]
+        last_hour.index = last_hour.index + timedelta(1)
+        temp_cal = temp_cal.append(last_hour)
+        temp_cal = temp_cal.resample('H').pad()
+        temp_cal = temp_cal[:-1]
+        temp_cal['Stunde'] = pd.DatetimeIndex(temp_cal.index).time
+        temp_cal = temp_cal.set_index(["Tagestyp", str(lk), 'Stunde'])
+        f = ('Lastprofil_{}.xls'.format(slp))
+        slp_profil = pd.read_excel(data_in('temporal',
+                                           'Gas Load Profiles', f))
+        slp_profil = pd.DataFrame(slp_profil.set_index(['Tagestyp',
+                                                'Temperatur\nin °C\nkleiner']))
+        slp_profil.columns = pd.to_datetime(slp_profil.columns,
+                                            format='%H:%M:%S')
+        slp_profil.columns = pd.DatetimeIndex(slp_profil.columns).time
+        slp_profil = slp_profil.stack()
+        temp_cal['Prozent'] = [slp_profil[x] for x in temp_cal.index]
+        # multiplication of temperatur independent gas demand with hourly
+        # factors
+        gas_temp_inde[int(lk)] = (ts_water[lk].values
+                                  * temp_cal['Prozent'].values/100)
+
+    # create space heating timeseries: difference between total heat demand
+    # and water heating demand
+    heat_norm = (gas_total - gas_temp_inde).clip(lower=0)
+
+    temp_allo = (resample_t_allo(temp_df=temperatur_df,
+                                 year=year)[[(i) for i in regions]])
+    heat_norm = heat_norm[temp_allo[temp_allo > 15].isnull()].fillna(0)
+
+    # normalise
+    heat_norm = heat_norm.divide(heat_norm.sum(axis=0), axis=1)
+    gas_tempinde_norm = gas_temp_inde.divide(gas_temp_inde.sum(axis=0), axis=1)
+
+    return heat_norm, gas_total, gas_tempinde_norm
+
+
+def resample_t_allo(temp_df=None, **kwargs):
+    """
+    Resamples the allocation temperature to match other dataframes in plot
+    Parameters:
+    temp_df : pd.DataFrame with temperature data, default None
+    """
+    # get base year
+    cfg = kwargs.get('cfg', get_config())
+    year = kwargs.get('year', cfg['base_year'])
+
+    # change index to datetime
+    if ((year % 4 == 0)
+            & (year % 100 != 0)
+            | (year % 4 == 0)
+            & (year % 100 == 0)
+            & (year % 400 == 0)):
+        periods = 35136
+    else:
+        periods = 35040
+    date = pd.date_range((str(year) + '-01-01'), periods=periods / 4, freq='H')
+    if temp_df is not None:
+        df = temp_df
+    else:
+        df = t_allo(year=year)
+    df.index = pd.to_datetime(df.index)
+    last_hour = df.copy()[-1:]
+    last_hour.index = last_hour.index + timedelta(1)
+    df = df.append(last_hour)
+
+    # resample
+    df = df.resample('H').pad()
+    df = df[:-1]
+    df.index = date
+    df.columns = df.columns.astype(int)
+
+    return df
 
 
 def getSunsetSunrise(doy, lat, lon, UTC_diff):
@@ -656,10 +996,15 @@ def disagg_temporal_power_CTS_blp(detailed=False, use_nuts3code=False,
     """
     cfg = kwargs.get('cfg', get_config())
     year = kwargs.get('year', cfg['base_year'])
-    if year not in range(2009, 2020):
-        raise ValueError("to use blp, `year` must be between 2009 and 2019.")
+    if year not in range(2009, 2021):
+        if year not in [2025, 2035, 2045]:
+            raise ValueError("to use blp, `year` must be between 2009 and" +
+                             " 2020 or in [2025, 2035, 2045].")
+
     # Obtain yearly power consumption per WZ per LK
-    sv_yearly = (disagg_CTS_industry('power', 'CTS'))
+    # sv_yearly = (disagg_CTS_industry('power', 'CTS', year=year)[0])  # old
+    sv_yearly = ((disagg_applications_eff('power', 'CTS', year=year))
+                 .groupby(level=0, axis=1).sum()).T
     # splitting yearly demand in two groups. slp group are disaggregated with
     # slp. blp group are disaggregated with blp (=profiles based on metered
     # load data from the demandregio project)
@@ -706,9 +1051,9 @@ def disagg_temporal_power_CTS_blp(detailed=False, use_nuts3code=False,
                              .drop(columns=['SLP']).stack().reset_index())
             sv_dtl_df = sv_lk.groupby(by=['level_1'])[[0]].sum().transpose()
             sv_lk = (sv_lk.assign(LK_WZ=lambda x: x.level_1.astype(str) + '_'
-                                  + x.level_0.astype(str))
+                                  + x.WZ.astype(str))
                      .set_index('LK_WZ')
-                     .drop(['level_0', 'level_1'], axis=1)
+                     .drop(['WZ', 'level_1'], axis=1)
                      .loc[lambda x: x[0] >= 0]
                      .transpose())
 
@@ -873,10 +1218,14 @@ def disagg_temporal_power_CTS_blp_by_state(detailed=False, use_nuts3code=False,
 
     cfg = kwargs.get('cfg', get_config())
     year = kwargs.get('year', cfg['base_year'])
-    if year not in range(2009, 2020):
-        raise ValueError("to use blp, `year` must be between 2009 and 2019.")
+    if year not in range(2009, 2021):
+        if year not in [2025, 2035, 2045]:
+            raise ValueError("to use blp, `year` must be between 2009 and" +
+                             " 2020 or in [2025, 2035, 2045].")
     # Obtain yearly power consumption per WZ per LK
-    sv_yearly = (disagg_CTS_industry('power', 'CTS', year=year))
+    # sv_yearly = (disagg_CTS_industry('power', 'CTS', year=year)[0])  # old
+    sv_yearly = ((disagg_applications_eff('power', 'CTS', year=year))
+                 .groupby(level=0, axis=1).sum()).T
     # splitting yearly demand in two groups. slp group are disaggregated with
     # slp. blp group are disaggregated with blp (=profiles based on metered
     # load data from the demandregio project)
@@ -933,9 +1282,9 @@ def disagg_temporal_power_CTS_blp_by_state(detailed=False, use_nuts3code=False,
                          .drop(columns=['SLP']).stack().reset_index())
         sv_dtl_df = sv_lk.groupby(by=['level_1'])[[0]].sum().transpose()
         sv_lk = (sv_lk.assign(LK_WZ=lambda x: x.level_1.astype(str) + '_'
-                              + x.level_0.astype(str))
+                              + x.WZ.astype(str))
                  .set_index('LK_WZ')
-                 .drop(['level_0', 'level_1'], axis=1)
+                 .drop(['WZ', 'level_1'], axis=1)
                  .loc[lambda x: x[0] >= 0]
                  .transpose())
 
@@ -1058,7 +1407,7 @@ def disagg_temporal_power_CTS_blp_by_state(detailed=False, use_nuts3code=False,
                                                             int(region)]))
                 elif branch in [42, 43]:
                     # these branches use the same blp, which is wz=41
-                    #logger.info('Working on WZ' + str(branch))
+                    # logger.info('Working on WZ' + str(branch))
                     if branch_model_41 is None:
                         branch_model_41 = regional_branch_load_profiles(wz=41,
                                                                 region=region,
@@ -1112,10 +1461,14 @@ def disagg_temporal_power_CTS(detailed=False, use_nuts3code=False, **kwargs):
     cfg = kwargs.get('cfg', get_config())
     year = kwargs.get('year', cfg['base_year'])
     # Obtain yearly power consumption per WZ per LK
-    sv_yearly = (disagg_CTS_industry('power', 'CTS', year=year)
-                 .transpose()
-                 .assign(BL=lambda x: [bl_dict().get(int(i[: -3]))
-                                       for i in x.index.astype(str)]))
+    # sv_yearly = (disagg_CTS_industry('power', 'CTS', year=year)[0]
+    #               .transpose()
+    #               .assign(BL=lambda x: [bl_dict().get(int(i[: -3]))
+    #                                     for i in x.index.astype(str)]))  #old
+    sv_yearly = ((disagg_applications_eff('power', 'CTS', year=year))
+                  .groupby(level=0, axis=1).sum()
+                  .assign(BL=lambda x: [bl_dict().get(int(i[: -3]))
+                                        for i in x.index.astype(str)]))
     total_sum = sv_yearly.drop('BL', axis=1).sum().sum()
 
     # Create empty 15min-index'ed DataFrame for target year
@@ -1147,9 +1500,9 @@ def disagg_temporal_power_CTS(detailed=False, use_nuts3code=False, **kwargs):
                              .drop(columns=['SLP']).stack().reset_index())
             sv_dtl_df = sv_lk.groupby(by=['level_1'])[[0]].sum().transpose()
             sv_lk = (sv_lk.assign(LK_WZ=lambda x: x.level_1.astype(str) + '_'
-                                  + x.level_0.astype(str))
+                                  + x.WZ.astype(str))
                      .set_index('LK_WZ')
-                     .drop(['level_0', 'level_1'], axis=1)
+                     .drop(['WZ', 'level_1'], axis=1)
                      .loc[lambda x: x[0] >= 0]
                      .transpose())
 
@@ -1224,8 +1577,12 @@ def disagg_temporal_power_CTS_by_state(detailed=False, use_nuts3code=False,
     cfg = kwargs.get('cfg', get_config())
     year = kwargs.get('year', cfg['base_year'])
     # Obtain yearly power consumption per WZ per LK
-    sv_yearly = (disagg_CTS_industry('power', 'CTS', year=year)
-                 .transpose()
+    # sv_yearly = (disagg_CTS_industry('power', 'CTS', year=year)[0]  # old
+    #              .transpose()
+    #              .assign(BL=lambda x: [bl_dict().get(int(i[: -3]))
+    #                                    for i in x.index.astype(str)]))
+    sv_yearly = ((disagg_applications_eff('power', 'CTS', year=year))
+                 .groupby(level=0, axis=1).sum()
                  .assign(BL=lambda x: [bl_dict().get(int(i[: -3]))
                                        for i in x.index.astype(str)]))
     # compute total sum for state for later plausibility check
@@ -1261,9 +1618,9 @@ def disagg_temporal_power_CTS_by_state(detailed=False, use_nuts3code=False,
                          .drop(columns=['SLP']).stack().reset_index())
         sv_dtl_df = sv_lk.groupby(by=['level_1'])[[0]].sum().transpose()
         sv_lk = (sv_lk.assign(LK_WZ=lambda x: x.level_1.astype(str) + '_'
-                              + x.level_0.astype(str))
+                              + x.WZ.astype(str))
                  .set_index('LK_WZ')
-                 .drop(['level_0', 'level_1'], axis=1)
+                 .drop(['WZ', 'level_1'], axis=1)
                  .loc[lambda x: x[0] >= 0]
                  .transpose())
 
@@ -1413,7 +1770,11 @@ def disagg_daily_gas_slp_cts(state, temperatur_df, **kwargs):
         days = 366
     else:
         days = 365
-    gv_lk = disagg_CTS_industry('gas', 'CTS', year=year).transpose()
+    # gv_lk = disagg_CTS_industry('gas', 'CTS', year=year)[0].transpose()  # old
+
+    gv_lk = ((disagg_applications_eff('gas', 'CTS', year=year))
+             .groupby(level=0, axis=1).sum())
+
     gv_lk_return = gv_lk.copy()
     gv_lk = (gv_lk.assign(BL=[bl_dict().get(int(x[: -3]))
                           for x in gv_lk.index.astype(str)]))
@@ -1446,7 +1807,7 @@ def disagg_daily_gas_slp_cts(state, temperatur_df, **kwargs):
         for lk in gv_df['level_1'].unique():
             gv_slp = (gv_df.loc[gv_df['level_1'] == lk]
                            .drop(columns=['level_1'])
-                           .set_index('level_0').transpose()
+                           .set_index('WZ').transpose()
                            .rename(columns=lambda x: str(lk) + '_' + str(x)))
             tw_lk_wz_slp = (pd.DataFrame(np.multiply(tw_norm[
                                                      [str(lk)]
@@ -1575,16 +1936,214 @@ def disagg_temporal_gas_CTS(detailed=False, use_nuts3code=False, **kwargs):
     """
     cfg = kwargs.get('cfg', get_config())
     year = kwargs.get('year', cfg['base_year'])
-    if ((year % 4 == 0) & (year % 100 != 0) | (year % 4 == 0)
-            & (year % 100 == 0) & (year % 400 == 0)):
-        hours = 8784
+
+    # check if timeseries exits on hard drive
+    if not detailed:
+        path = data_out('CTS_gas_total_' + str(year) + '.csv')
     else:
-        hours = 8760
-    temperatur_df = t_allo(year=year)
-    df = pd.DataFrame(0, columns=temperatur_df.columns,
-                      index=pd.date_range((str(year) + '-01-01'),
-                                          periods=hours, freq='H'))
-    for state in bl_dict().values():
+        path = data_out('CTS_gas_total_detailed_' + str(year) + '.csv')
+    if os.path.exists(path):
+        logger.info('Reading total gas temporal disaggregated'
+                    ' timeseries from hard drive.')
+        if not detailed:
+            gas_total = pd.read_csv(path, index_col=0)
+            gas_total.index = pd.to_datetime(gas_total.index)
+            gas_total.columns = gas_total.columns.astype(int)
+        else:
+            gas_total = pd.read_csv(path, header=[0, 1], index_col=0)
+            gas_total.index = pd.to_datetime(gas_total.index)
+            gas_total.columns = gas_total.columns.set_levels(
+                [gas_total.columns.levels[0].astype(int),
+                 gas_total.columns.levels[1].astype(int)])
+        if use_nuts3code:
+            gas_total = gas_total.rename(columns=dict_region_code(
+                level='lk', keys='ags_lk', values='natcode_nuts3'),
+                level=(0 if detailed else None))
+        return gas_total
+    # if does not exist on hard drive, calculate
+    else:
+        if ((year % 4 == 0) & (year % 100 != 0) | (year % 4 == 0)
+                & (year % 100 == 0) & (year % 400 == 0)):
+            hours = 8784
+        else:
+            hours = 8760
+        temperatur_df = t_allo(year=year)
+        df = pd.DataFrame(0, columns=temperatur_df.columns,
+                          index=pd.date_range((str(year) + '-01-01'),
+                                              periods=hours, freq='H'))
+        for state in bl_dict().values():
+            logger.info('Working on state: {}.'.format(state))
+            tw_df, gv_lk = disagg_daily_gas_slp_cts(state, temperatur_df,
+                                                    year=year)
+            gv_lk = (gv_lk.assign(BL=[bl_dict().get(int(x[:-3]))
+                                      for x in gv_lk.index.astype(str)]))
+            t_allo_df = temperatur_df[gv_lk.loc[gv_lk['BL'] == state]
+                                           .index.astype(str)]
+            for col in t_allo_df.columns:
+                t_allo_df[col].values[t_allo_df[col].values < -15] = -15
+                t_allo_df[col].values[(t_allo_df[col].values > -15)
+                                      & (t_allo_df[col].values < -10)] = -10
+                t_allo_df[col].values[(t_allo_df[col].values > -10)
+                                      & (t_allo_df[col].values < -5)] = -5
+                t_allo_df[col].values[(t_allo_df[col].values > -5)
+                                      & (t_allo_df[col].values < 0)] = 0
+                t_allo_df[col].values[(t_allo_df[col].values > 0)
+                                      & (t_allo_df[col].values < 5)] = 5
+                t_allo_df[col].values[(t_allo_df[col].values > 5)
+                                      & (t_allo_df[col].values < 10)] = 10
+                t_allo_df[col].values[(t_allo_df[col].values > 10)
+                                      & (t_allo_df[col].values < 15)] = 15
+                t_allo_df[col].values[(t_allo_df[col].values > 15)
+                                      & (t_allo_df[col].values < 20)] = 20
+                t_allo_df[col].values[(t_allo_df[col].values > 20)
+                                      & (t_allo_df[col].values < 25)] = 25
+                t_allo_df[col].values[(t_allo_df[col].values > 25)] = 100
+                t_allo_df = t_allo_df.astype('int32')
+            f_wd = ['FW_BA', 'FW_BD', 'FW_BH', 'FW_GA', 'FW_GB', 'FW_HA',
+                    'FW_KO', 'FW_MF', 'FW_MK', 'FW_PD', 'FW_WA',
+                    'FW_SpaceHeating-MFH', 'FW_SpaceHeating-EFH',
+                    'FW_Cooking_HotWater-HKO']
+            calender_df = (gas_slp_weekday_params(state, year=year)
+                           .drop(columns=f_wd))
+            temp_calender_df = (pd.concat([calender_df.reset_index(),
+                                           t_allo_df.reset_index()], axis=1))
+
+            if temp_calender_df.isnull().values.any():
+                raise KeyError('The chosen historical weather year and the '
+                               'chosen projected year have mismatching '
+                               'lengths. This could be due to gap years. '
+                               'Please change the historical year in '
+                               'hist_weather_year() in config.py to a year of '
+                               'matching length.')
+
+            temp_calender_df['Tagestyp'] = 'MO'
+            for typ in ['DI', 'MI', 'DO', 'FR', 'SA', 'SO']:
+                (temp_calender_df.loc[temp_calender_df[typ], 'Tagestyp']) = typ
+            list_lk = gv_lk.loc[gv_lk['BL'] == state].index.astype(str)
+            for lk in list_lk:
+                lk_df = pd.DataFrame(index=pd.date_range(
+                    (str(year) + '-01-01'), periods=hours, freq='H'))
+                tw_df_lk = tw_df.loc[:, int(lk)]
+                tw_df_lk.index = pd.DatetimeIndex(tw_df_lk.index)
+                last_hour = tw_df_lk.copy()[-1:]
+                last_hour.index = last_hour.index + timedelta(1)
+                tw_df_lk = tw_df_lk.append(last_hour)
+                tw_df_lk = tw_df_lk.resample('H').pad()
+                tw_df_lk = tw_df_lk[:-1]
+
+                temp_cal = temp_calender_df.copy()
+                temp_cal = temp_cal[['Date', 'Tagestyp', lk]].set_index("Date")
+                last_hour = temp_cal.copy()[-1:]
+                last_hour.index = last_hour.index + timedelta(1)
+                temp_cal = temp_cal.append(last_hour)
+                temp_cal = temp_cal.resample('H').pad()
+                temp_cal = temp_cal[:-1]
+                temp_cal['Stunde'] = pd.DatetimeIndex(temp_cal.index).time
+                temp_cal = temp_cal.set_index(["Tagestyp", lk, 'Stunde'])
+
+                for slp in list(dict.fromkeys(slp_wz_g().values())):
+                    f = ('Lastprofil_{}.xls'.format(slp))
+                    slp_profil = pd.read_excel(data_in('temporal',
+                                                       'Gas Load Profiles', f))
+                    slp_profil = pd.DataFrame(slp_profil.set_index(
+                        ['Tagestyp', 'Temperatur\nin °C\nkleiner']))
+                    slp_profil.columns = pd.to_datetime(slp_profil.columns,
+                                                        format='%H:%M:%S')
+                    slp_profil.columns = pd.DatetimeIndex(
+                        slp_profil.columns).time
+                    slp_profil = slp_profil.stack()
+                    temp_cal['Prozent'] = [slp_profil[x] for x in temp_cal.index]
+                    for wz in [k for k, v in slp_wz_g().items()
+                               if v.startswith(slp)]:
+                        lk_df[str(lk) + '_' + str(wz)] = (tw_df_lk[wz].values
+                                                          * temp_cal['Prozent']
+                                                          .values/100)
+                        df[str(lk) + '_' + str(wz)] = (tw_df_lk[wz].values
+                                                       * temp_cal['Prozent']
+                                                       .values/100)
+                df[str(lk)] = lk_df.sum(axis=1)
+        if detailed:
+            df = df.drop(columns=gv_lk.index.astype(str))
+            df.columns =\
+                pd.MultiIndex.from_tuples([(int(x), int(y)) for x, y in
+                                           df.columns.str.split('_')])
+        else:
+            df = df[gv_lk.index.astype(str)]
+            df.columns = df.columns.astype(int)
+        # save to hard drive
+        df.to_csv(path)
+        if use_nuts3code:
+            df = df.rename(columns=dict_region_code(level='lk', keys='ags_lk',
+                                                    values='natcode_nuts3'),
+                           level=(0 if detailed else None))
+        return df
+
+
+def disagg_temporal_gas_CTS_by_state(detailed=False, use_nuts3code=False,
+                                     state=None, **kwargs):
+    """
+    Disagreggate spatial data of CTS' gas demand temporally.
+
+    detailed : bool, default False
+        If True return 'per district and branch' else only 'per district'
+    use_nuts3code : bool, default False
+        If True use NUTS-3 codes as region identifiers.
+    state : str, default None
+        Specifies state. Must by one of the entries of bl_dict().values(),
+        ['SH', 'HH', 'NI', 'HB', 'NW', 'HE', 'RP', 'BW', 'BY', 'SL', 'BE',
+         'BB', 'MV', 'SN', 'ST', 'TH']
+    Returns
+    -------
+    pd.DataFrame
+    """
+    assert state in list(bl_dict().values()), ("'state' needs to be in ['SH',"
+                                               "'HH', 'NI', 'HB', 'NW', 'HE',"
+                                               "'RP', 'BW', 'BY', 'SL', 'BE',"
+                                               "'BB', 'MV', 'SN', 'ST', 'TH']")
+    assert isinstance(state, str), "'state' needs to be a string."
+    # get config and year, if not given in kwargs
+    cfg = kwargs.get('cfg', get_config())
+    year = kwargs.get('year', cfg['base_year'])  # get year
+    # check if timeseries exits on hard drive
+    if not detailed:
+        path = data_out('CTS_gas_total_' + str(state) + '_' + str(year)
+                        + '.csv')
+    else:
+        path = data_out('CTS_gas_total_detailed_' + str(state) + '_'
+                        + str(year) + '.csv')
+    if os.path.exists(path):
+        logger.info('Reading total gas temporal disaggregated'
+                    ' timeseries from hard drive.')
+        if not detailed:
+            gas_total = pd.read_csv(path, index_col=0)
+            gas_total.index = pd.to_datetime(gas_total.index)
+            gas_total.columns = gas_total.columns.astype(int)
+        else:
+            gas_total = pd.read_csv(path, header=[0, 1], index_col=0)
+            gas_total.index = pd.to_datetime(gas_total.index)
+            gas_total.columns = gas_total.columns.set_levels(
+                [gas_total.columns.levels[0].astype(int),
+                 gas_total.columns.levels[1].astype(int)])
+        if use_nuts3code:
+            gas_total = gas_total.rename(columns=dict_region_code(
+                level='lk', keys='ags_lk', values='natcode_nuts3'),
+                level=(0 if detailed else None))
+        return gas_total
+    # if does not exist on hard drive, calculate
+    else:
+        # check if gap year
+        if ((year % 4 == 0) & (year % 100 != 0) | (year % 4 == 0)
+                & (year % 100 == 0) & (year % 400 == 0)):
+            hours = 8784
+        else:
+            hours = 8760
+        temperatur_df = t_allo(year=year)  # get daily allocation temperature
+        # create DataFrame from temperature and use timestamp as index
+        df = pd.DataFrame(0, columns=temperatur_df.columns,
+                          index=pd.date_range((str(year) + '-01-01'),
+                                              periods=hours, freq='H'),
+                          dtype='float')
+        # for state in bl_dict().values():
         logger.info('Working on state: {}.'.format(state))
         tw_df, gv_lk = disagg_daily_gas_slp_cts(state, temperatur_df,
                                                 year=year)
@@ -1634,7 +2193,8 @@ def disagg_temporal_gas_CTS(detailed=False, use_nuts3code=False, **kwargs):
         list_lk = gv_lk.loc[gv_lk['BL'] == state].index.astype(str)
         for lk in list_lk:
             lk_df = pd.DataFrame(index=pd.date_range((str(year) + '-01-01'),
-                                                     periods=hours, freq='H'))
+                                                     periods=hours, freq='H'),
+                                 dtype='float')
             tw_df_lk = tw_df.loc[:, int(lk)]
             tw_df_lk.index = pd.DatetimeIndex(tw_df_lk.index)
             last_hour = tw_df_lk.copy()[-1:]
@@ -1657,15 +2217,14 @@ def disagg_temporal_gas_CTS(detailed=False, use_nuts3code=False, **kwargs):
                 f = ('Lastprofil_{}.xls'.format(slp))
                 slp_profil = pd.read_excel(data_in('temporal',
                                                    'Gas Load Profiles', f))
-                slp_profil = pd.DataFrame(slp_profil.set_index(['Tagestyp',
-                                            'Temperatur\nin °C\nkleiner']))
+                slp_profil = pd.DataFrame(slp_profil.set_index(
+                    ['Tagestyp', 'Temperatur\nin °C\nkleiner']))
                 slp_profil.columns = pd.to_datetime(slp_profil.columns,
                                                     format='%H:%M:%S')
                 slp_profil.columns = pd.DatetimeIndex(slp_profil.columns).time
                 slp_profil = slp_profil.stack()
                 temp_cal['Prozent'] = [slp_profil[x] for x in temp_cal.index]
-                for wz in [k for k, v in slp_wz_g().items()
-                           if v.startswith(slp)]:
+                for wz in [k for k, v in slp_wz_g().items() if v.startswith(slp)]:
                     lk_df[str(lk) + '_' + str(wz)] = (tw_df_lk[wz].values
                                                       * temp_cal['Prozent']
                                                       .values/100)
@@ -1673,159 +2232,22 @@ def disagg_temporal_gas_CTS(detailed=False, use_nuts3code=False, **kwargs):
                                                    * temp_cal['Prozent']
                                                    .values/100)
             df[str(lk)] = lk_df.sum(axis=1)
-    if detailed:
-        df = df.drop(columns=gv_lk.index.astype(str))
-        df.columns =\
-            pd.MultiIndex.from_tuples([(int(x), int(y)) for x, y in
-                                       df.columns.str.split('_')])
-    else:
-        df = df[gv_lk.index.astype(str)]
-
-    if use_nuts3code:
-        df = df.rename(columns=dict_region_code(level='lk', keys='ags_lk',
-                                                values='natcode_nuts3'),
-                       level=(0 if detailed else None))
-    return df
-
-
-def disagg_temporal_gas_CTS_by_state(detailed=False, use_nuts3code=False,
-                                     state=None, **kwargs):
-    """
-    Disagreggate spatial data of CTS' gas demand temporally.
-
-    detailed : bool, default False
-        If True return 'per district and branch' else only 'per district'
-    use_nuts3code : bool, default False
-        If True use NUTS-3 codes as region identifiers.
-    state : str, default None
-        Specifies state. Must by one of the entries of bl_dict().values(),
-        ['SH', 'HH', 'NI', 'HB', 'NW', 'HE', 'RP', 'BW', 'BY', 'SL', 'BE',
-         'BB', 'MV', 'SN', 'ST', 'TH']
-    Returns
-    -------
-    pd.DataFrame
-    """
-    assert state in list(bl_dict().values()), ("'state' needs to be in ['SH',"
-                                               "'HH', 'NI', 'HB', 'NW', 'HE',"
-                                               "'RP', 'BW', 'BY', 'SL', 'BE',"
-                                               "'BB', 'MV', 'SN', 'ST', 'TH']")
-    assert isinstance(state, str), "'state' needs to be a string."
-    # get config and year, if not given in kwargs
-    cfg = kwargs.get('cfg', get_config())
-    year = kwargs.get('year', cfg['base_year'])  # get year
-    # check if gap year
-    if ((year % 4 == 0) & (year % 100 != 0) | (year % 4 == 0)
-            & (year % 100 == 0) & (year % 400 == 0)):
-        hours = 8784
-    else:
-        hours = 8760
-    temperatur_df = t_allo(year=year)  # get daily allocation temperature
-    # create DataFrame from temperature and use timestamp as index
-    df = pd.DataFrame(0, columns=temperatur_df.columns,
-                      index=pd.date_range((str(year) + '-01-01'),
-                                          periods=hours, freq='H'))
-    # for state in bl_dict().values():
-    logger.info('Working on state: {}.'.format(state))
-    tw_df, gv_lk = disagg_daily_gas_slp_cts(state, temperatur_df,
-                                            year=year)
-    gv_lk = (gv_lk.assign(BL=[bl_dict().get(int(x[:-3]))
-                              for x in gv_lk.index.astype(str)]))
-    t_allo_df = temperatur_df[gv_lk.loc[gv_lk['BL'] == state]
-                                   .index.astype(str)]
-    for col in t_allo_df.columns:
-        t_allo_df[col].values[t_allo_df[col].values < -15] = -15
-        t_allo_df[col].values[(t_allo_df[col].values > -15)
-                              & (t_allo_df[col].values < -10)] = -10
-        t_allo_df[col].values[(t_allo_df[col].values > -10)
-                              & (t_allo_df[col].values < -5)] = -5
-        t_allo_df[col].values[(t_allo_df[col].values > -5)
-                              & (t_allo_df[col].values < 0)] = 0
-        t_allo_df[col].values[(t_allo_df[col].values > 0)
-                              & (t_allo_df[col].values < 5)] = 5
-        t_allo_df[col].values[(t_allo_df[col].values > 5)
-                              & (t_allo_df[col].values < 10)] = 10
-        t_allo_df[col].values[(t_allo_df[col].values > 10)
-                              & (t_allo_df[col].values < 15)] = 15
-        t_allo_df[col].values[(t_allo_df[col].values > 15)
-                              & (t_allo_df[col].values < 20)] = 20
-        t_allo_df[col].values[(t_allo_df[col].values > 20)
-                              & (t_allo_df[col].values < 25)] = 25
-        t_allo_df[col].values[(t_allo_df[col].values > 25)] = 100
-        t_allo_df = t_allo_df.astype('int32')
-    f_wd = ['FW_BA', 'FW_BD', 'FW_BH', 'FW_GA', 'FW_GB', 'FW_HA', 'FW_KO',
-            'FW_MF', 'FW_MK', 'FW_PD', 'FW_WA', 'FW_SpaceHeating-MFH',
-            'FW_SpaceHeating-EFH',
-            'FW_Cooking_HotWater-HKO']
-    calender_df = (gas_slp_weekday_params(state, year=year)
-                   .drop(columns=f_wd))
-    temp_calender_df = (pd.concat([calender_df.reset_index(),
-                                   t_allo_df.reset_index()], axis=1))
-
-    if temp_calender_df.isnull().values.any():
-        raise KeyError('The chosen historical weather year and the chosen '
-                       'projected year have mismatching lengths.'
-                       'This could be due to gap years. Please change the '
-                       'historical year in hist_weather_year() in '
-                       'config.py to a year of matching length.')
-
-    temp_calender_df['Tagestyp'] = 'MO'
-    for typ in ['DI', 'MI', 'DO', 'FR', 'SA', 'SO']:
-        (temp_calender_df.loc[temp_calender_df[typ], 'Tagestyp']) = typ
-    list_lk = gv_lk.loc[gv_lk['BL'] == state].index.astype(str)
-    for lk in list_lk:
-        lk_df = pd.DataFrame(index=pd.date_range((str(year) + '-01-01'),
-                                                 periods=hours, freq='H'))
-        tw_df_lk = tw_df.loc[:, int(lk)]
-        tw_df_lk.index = pd.DatetimeIndex(tw_df_lk.index)
-        last_hour = tw_df_lk.copy()[-1:]
-        last_hour.index = last_hour.index + timedelta(1)
-        tw_df_lk = tw_df_lk.append(last_hour)
-        tw_df_lk = tw_df_lk.resample('H').pad()
-        tw_df_lk = tw_df_lk[:-1]
-
-        temp_cal = temp_calender_df.copy()
-        temp_cal = temp_cal[['Date', 'Tagestyp', lk]].set_index("Date")
-        last_hour = temp_cal.copy()[-1:]
-        last_hour.index = last_hour.index + timedelta(1)
-        temp_cal = temp_cal.append(last_hour)
-        temp_cal = temp_cal.resample('H').pad()
-        temp_cal = temp_cal[:-1]
-        temp_cal['Stunde'] = pd.DatetimeIndex(temp_cal.index).time
-        temp_cal = temp_cal.set_index(["Tagestyp", lk, 'Stunde'])
-
-        for slp in list(dict.fromkeys(slp_wz_g().values())):
-            f = ('Lastprofil_{}.xls'.format(slp))
-            slp_profil = pd.read_excel(data_in('temporal',
-                                               'Gas Load Profiles', f))
-            slp_profil = pd.DataFrame(slp_profil.set_index(['Tagestyp',
-                                        'Temperatur\nin °C\nkleiner']))
-            slp_profil.columns = pd.to_datetime(slp_profil.columns,
-                                                format='%H:%M:%S')
-            slp_profil.columns = pd.DatetimeIndex(slp_profil.columns).time
-            slp_profil = slp_profil.stack()
-            temp_cal['Prozent'] = [slp_profil[x] for x in temp_cal.index]
-            for wz in [k for k, v in slp_wz_g().items() if v.startswith(slp)]:
-                lk_df[str(lk) + '_' + str(wz)] = (tw_df_lk[wz].values
-                                                  * temp_cal['Prozent']
-                                                  .values/100)
-                df[str(lk) + '_' + str(wz)] = (tw_df_lk[wz].values
-                                               * temp_cal['Prozent']
-                                               .values/100)
-        df[str(lk)] = lk_df.sum(axis=1)
-    if detailed:
-        df = df.drop(columns=gv_lk.index.astype(str))
-        df.columns =\
-            pd.MultiIndex.from_tuples([(int(x), int(y)) for x, y in
-                                       df.columns.str.split('_')])
-    else:
-        df = df[gv_lk.index.astype(str)]
-        df = df[list_lk]
-
-    if use_nuts3code:
-        df = df.rename(columns=dict_region_code(level='lk', keys='ags_lk',
-                                                values='natcode_nuts3'),
-                       level=(0 if detailed else None))
-    return df
+        if detailed:
+            df = df.drop(columns=gv_lk.index.astype(str))
+            df.columns =\
+                pd.MultiIndex.from_tuples([(int(x), int(y)) for x, y in
+                                           df.columns.str.split('_')])
+        else:
+            df = df[gv_lk.index.astype(str)]
+            df = df[list_lk]
+            df.columns = df.columns.astype(int)
+        # save to hard drive
+        df.to_csv(path)
+        if use_nuts3code:
+            df = df.rename(columns=dict_region_code(level='lk', keys='ags_lk',
+                                                    values='natcode_nuts3'),
+                           level=(0 if detailed else None))
+        return df
 
 
 def disagg_temporal_gas_households(use_nuts3code=False, how='top-down',
@@ -1929,8 +2351,8 @@ def disagg_temporal_gas_households(use_nuts3code=False, how='top-down',
                 f = ('Lastprofil_{}.xls'.format(slp))
                 slp_profil = pd.read_excel(data_in('temporal',
                                                    'Gas Load Profiles', f))
-                slp_profil = pd.DataFrame(slp_profil.set_index(['Tagestyp',
-                                            'Temperatur\nin °C\nkleiner']))
+                slp_profil = pd.DataFrame(slp_profil.set_index(
+                    ['Tagestyp', 'Temperatur\nin °C\nkleiner']))
                 slp_profil.columns = pd.to_datetime(slp_profil.columns,
                                                     format='%H:%M:%S')
                 slp_profil.columns = pd.DatetimeIndex(slp_profil.columns).time
@@ -1955,7 +2377,7 @@ def disagg_temporal_gas_households(use_nuts3code=False, how='top-down',
 
 
 def disagg_temporal_industry_blp(source='power', detailed=False,
-                                 use_nuts3code=False, low=0.4,
+                                 use_nuts3code=False, low=0.5,
                                  no_self_gen=False, **kwargs):
     """
     Disagreggate spatial data of industrie's power or gas demand temporally.
@@ -1982,14 +2404,19 @@ def disagg_temporal_industry_blp(source='power', detailed=False,
     """
     cfg = kwargs.get('cfg', get_config())
     year = kwargs.get('year', cfg['base_year'])
-    if year not in range(2009, 2020):
-        raise ValueError("to use blp, `year` must be between 2009 and 2019.")
+    if year not in range(2009, 2021):
+        if year not in [2025, 2035, 2045]:
+            raise ValueError("to use blp, `year` must be between 2009 and" +
+                             " 2020 or in [2025, 2035, 2045].")
     if source != 'power':
         raise ValueError("blp can only used for electricity consumption."
                          'change source to "power".')
     # Obtain yearly power consumption per WZ per LK
-    ec_yearly = (disagg_CTS_industry('power', 'industry', year=year,
-                                     no_self_gen=no_self_gen))
+    # ec_yearly = (disagg_CTS_industry('power', 'industry', year=year,
+    #                                  no_self_gen=no_self_gen)[0])  # old
+    ec_yearly = ((disagg_applications_eff('power', 'industry',
+                                          no_self_gen=no_self_gen, year=year))
+                 .groupby(level=0, axis=1).sum()).T
 
     # splitting yearly demand in two groups. slp group are disaggregated with
     # shift load profiles. blp group are disaggregated with blp
@@ -2039,9 +2466,9 @@ def disagg_temporal_industry_blp(source='power', detailed=False,
                              .drop(columns=['SP']).stack().reset_index())
             sv_dtl_df = sv_lk.groupby(by=['level_1'])[[0]].sum().transpose()
             sv_lk = (sv_lk.assign(LK_WZ=lambda x: x.level_1.astype(str) + '_'
-                                  + x.level_0.astype(str))
+                                  + x.WZ.astype(str))
                      .set_index('LK_WZ')
-                     .drop(['level_0', 'level_1'], axis=1)
+                     .drop(['WZ', 'level_1'], axis=1)
                      .loc[lambda x: x[0] >= 0]
                      .transpose())
 
@@ -2127,7 +2554,7 @@ def disagg_temporal_industry_blp(source='power', detailed=False,
 
 
 def disagg_temporal_industry_blp_by_state(source='power', detailed=False,
-                                          use_nuts3code=False, low=0.4,
+                                          use_nuts3code=False, low=0.5,
                                           no_self_gen=False, state=None,
                                           **kwargs):
     """
@@ -2165,14 +2592,19 @@ def disagg_temporal_industry_blp_by_state(source='power', detailed=False,
 
     cfg = kwargs.get('cfg', get_config())
     year = kwargs.get('year', cfg['base_year'])
-    if year not in range(2009, 2020):
-        raise ValueError("to use blp, `year` must be between 2009 and 2019.")
+    if year not in range(2009, 2021):
+        if year not in [2025, 2035, 2045]:
+            raise ValueError("to use blp, `year` must be between 2009 and" +
+                             " 2020 or in [2025, 2035, 2045].")
     if source != 'power':
         raise ValueError("blp can only used for electricity consumption."
                          'change source to "power".')
     # Obtain yearly power consumption per WZ per LK
-    ec_yearly = (disagg_CTS_industry('power', 'industry', year=year,
-                                     no_self_gen=no_self_gen))
+    # ec_yearly = (disagg_CTS_industry('power', 'industry', year=year,
+    #                                  no_self_gen=no_self_gen)[0])  # old
+    ec_yearly = ((disagg_applications_eff('power', 'industry',
+                                          no_self_gen=no_self_gen, year=year))
+                 .groupby(level=0, axis=1).sum()).T
     # splitting yearly demand in two groups. slp group are disaggregated with
     # shift load profiles. blp group are disaggregated with blp
     # (=profiles based on metered load data from the demandregio project)
@@ -2231,9 +2663,9 @@ def disagg_temporal_industry_blp_by_state(source='power', detailed=False,
                          .drop(columns=['SP']).stack().reset_index())
         sv_dtl_df = sv_lk.groupby(by=['level_1'])[[0]].sum().transpose()
         sv_lk = (sv_lk.assign(LK_WZ=lambda x: x.level_1.astype(str) + '_'
-                              + x.level_0.astype(str))
+                              + x.WZ.astype(str))
                  .set_index('LK_WZ')
-                 .drop(['level_0', 'level_1'], axis=1)
+                 .drop(['WZ', 'level_1'], axis=1)
                  .loc[lambda x: x[0] >= 0]
                  .transpose())
 
@@ -2341,7 +2773,7 @@ def disagg_temporal_industry_blp_by_state(source='power', detailed=False,
 
 
 def disagg_temporal_industry(source, detailed=False, use_nuts3code=False,
-                             low=0.4, no_self_gen=False, **kwargs):
+                             low=0.5, no_self_gen=False, **kwargs):
     """
     Disagreggate spatial data of industrie's power or gas demand temporally.
 
@@ -2368,9 +2800,14 @@ def disagg_temporal_industry(source, detailed=False, use_nuts3code=False,
     cfg = kwargs.get('cfg', get_config())
     year = kwargs.get('year', cfg['base_year'])
     # Obtain yearly power consumption per WZ per LK
-    ec_yearly = (disagg_CTS_industry(source, 'industry',
-                                     no_self_gen=no_self_gen, year=year)
-                 .transpose()
+    # ec_yearly = (disagg_CTS_industry(source, 'industry',
+    #                                  no_self_gen=no_self_gen, year=year)[0]
+    #              .transpose()
+    #              .assign(BL=lambda x: [bl_dict().get(int(i[: -3]))
+    #                                    for i in x.index.astype(str)]))  # old
+    ec_yearly = ((disagg_applications_eff(source, 'industry',
+                                          no_self_gen=no_self_gen, year=year))
+                 .groupby(level=0, axis=1).sum()
                  .assign(BL=lambda x: [bl_dict().get(int(i[: -3]))
                                        for i in x.index.astype(str)]))
     total_sum = ec_yearly.drop('BL', axis=1).sum().sum()  # for later check
@@ -2404,9 +2841,9 @@ def disagg_temporal_industry(source, detailed=False, use_nuts3code=False,
                              .drop(columns=['SP']).stack().reset_index())
             sv_dtl_df = sv_lk.groupby(by=['level_1'])[[0]].sum().transpose()
             sv_lk = (sv_lk.assign(LK_WZ=lambda x: x.level_1.astype(str) + '_'
-                                  + x.level_0.astype(str))
+                                  + x.WZ.astype(str))
                      .set_index('LK_WZ')
-                     .drop(['level_0', 'level_1'], axis=1)
+                     .drop(['WZ', 'level_1'], axis=1)
                      .loc[lambda x: x[0] >= 0]
                      .transpose())
 
@@ -2453,7 +2890,7 @@ def disagg_temporal_industry(source, detailed=False, use_nuts3code=False,
 
 
 def disagg_temporal_industry_by_state(source, detailed=False,
-                                      use_nuts3code=False, low=0.4,
+                                      use_nuts3code=False, low=0.5,
                                       no_self_gen=False, state=None, **kwargs):
     """
     Disagreggate spatial data of industrie's power or gas demand temporally.
@@ -2491,11 +2928,17 @@ def disagg_temporal_industry_by_state(source, detailed=False,
     cfg = kwargs.get('cfg', get_config())
     year = kwargs.get('year', cfg['base_year'])
     # Obtain yearly power consumption per WZ per LK
-    ec_yearly = (disagg_CTS_industry(source, 'industry',
-                                     no_self_gen=no_self_gen, year=year)
-                 .transpose()
+    # ec_yearly = (disagg_CTS_industry(source, 'industry',
+    #                                  no_self_gen=no_self_gen, year=year)[0]
+    #              .transpose()
+    #              .assign(BL=lambda x: [bl_dict().get(int(i[: -3]))
+    #                                    for i in x.index.astype(str)]))  # old
+    ec_yearly = ((disagg_applications_eff(source, 'industry',
+                                          no_self_gen=no_self_gen, year=year))
+                 .groupby(level=0, axis=1).sum()
                  .assign(BL=lambda x: [bl_dict().get(int(i[: -3]))
                                        for i in x.index.astype(str)]))
+
     # total_sum = ec_yearly.drop('BL', axis=1).sum().sum()  # for later check
     total_sum = (ec_yearly.loc[ec_yearly['BL'] == state]
                  .sum(numeric_only=True)
@@ -2530,9 +2973,9 @@ def disagg_temporal_industry_by_state(source, detailed=False,
                          .drop(columns=['SP']).stack().reset_index())
         sv_dtl_df = sv_lk.groupby(by=['level_1'])[[0]].sum().transpose()
         sv_lk = (sv_lk.assign(LK_WZ=lambda x: x.level_1.astype(str) + '_'
-                              + x.level_0.astype(str))
+                              + x.WZ.astype(str))
                  .set_index('LK_WZ')
-                 .drop(['level_0', 'level_1'], axis=1)
+                 .drop(['WZ', 'level_1'], axis=1)
                  .loc[lambda x: x[0] >= 0]
                  .transpose())
 
@@ -2602,7 +3045,7 @@ def disagg_temporal_gas_CTS_water(detailed=False, use_nuts3code=False,
     temperatur_df = t_allo(year=year)
 
     # Below 13°C the water heating demand is assumed to be constant
-    temperatur_df.clip(13, inplace=True)
+    temperatur_df.clip(15, inplace=True)
 
     df = pd.DataFrame(0, columns=temperatur_df.columns,
                       index=pd.date_range((str(year) + '-01-01'),
@@ -2662,17 +3105,18 @@ def disagg_temporal_gas_CTS_water(detailed=False, use_nuts3code=False,
                 f = ('Lastprofil_{}.xls'.format(slp))
                 slp_profil = pd.read_excel(data_in('temporal',
                                                    'Gas Load Profiles', f))
-                slp_profil = pd.DataFrame(slp_profil.set_index(['Tagestyp',
-                                            'Temperatur\nin °C\nkleiner']))
+                slp_profil = pd.DataFrame(slp_profil.set_index(
+                    ['Tagestyp', 'Temperatur\nin °C\nkleiner']))
                 slp_profil.columns = pd.to_datetime(slp_profil.columns,
                                                     format='%H:%M:%S')
                 slp_profil.columns = pd.DatetimeIndex(slp_profil.columns).time
                 slp_profil = slp_profil.stack()
                 temp_cal['Prozent'] = [slp_profil[x] for x in temp_cal.index]
                 for wz in [k for k, v in slp_wz_g().items()
-                                      if v.startswith(slp)]:
+                           if v.startswith(slp)]:
                     lk_df[str(lk) + '_' + str(wz)] = (tw_df_lk[wz].values
-                                        * temp_cal['Prozent'].values/100)
+                                                      * temp_cal['Prozent']
+                                                      .values/100)
                     df[str(lk) + '_' + str(wz)] = (tw_df_lk[wz].values
                                                    * temp_cal['Prozent']
                                                    .values/100)
@@ -2681,8 +3125,8 @@ def disagg_temporal_gas_CTS_water(detailed=False, use_nuts3code=False,
     if detailed:
         df = df.drop(columns=gv_lk.index.astype(str))
         df.columns =\
-                    pd.MultiIndex.from_tuples([(int(x), int(y)) for x, y in
-                                               df.columns.str.split('_')])
+            pd.MultiIndex.from_tuples([(int(x), int(y)) for x, y in
+                                       df.columns.str.split('_')])
     else:
         df = df[gv_lk.index.astype(str)]
 
@@ -2718,103 +3162,133 @@ def disagg_temporal_gas_CTS_water_by_state(detailed=False, use_nuts3code=False,
     # get config and year, if not given in kwargs
     cfg = kwargs.get('cfg', get_config())
     year = kwargs.get('year', cfg['base_year'])
-    # check if gap year
-    if ((year % 4 == 0) & (year % 100 != 0) | (year % 4 == 0)
-            & (year % 100 == 0) & (year % 400 == 0)):
-        hours = 8784
+    # check if timeseries exits on hard drive
+    if not detailed:
+        path = data_out('CTS_gas_tempinde_' + str(state) + '_' + str(year)
+                        + '.csv')
     else:
-        hours = 8760
-    temperatur_df = t_allo(year=year)  # get daily allocation temperature
-    # Below 13°C the water heating demand is assumed to be constant
-    temperatur_df.clip(13, inplace=True)
-    # create DataFrame from temperature and use timestamp as index
-    df = pd.DataFrame(0, columns=temperatur_df.columns,
-                      index=pd.date_range((str(year) + '-01-01'),
-                                          periods=hours, freq='H'))
-    # for state in bl_dict().values():
-    logger.info('Working on state: {}.'.format(state))
-    tw_df, gv_lk = disagg_daily_gas_slp_water(state, temperatur_df,
-                                              year=year)
-    gv_lk = (gv_lk.assign(BL=[bl_dict().get(int(x[:-3]))
-                              for x in gv_lk.index.astype(str)]))
-    t_allo_df = temperatur_df[gv_lk.loc[gv_lk['BL'] == state]
-                                   .index.astype(str)]
-
-    t_allo_df.values[:] = 100  # changed
-    t_allo_df = t_allo_df.astype('int32')
-
-    f_wd = ['FW_BA', 'FW_BD', 'FW_BH', 'FW_GA', 'FW_GB', 'FW_HA', 'FW_KO',
-            'FW_MF', 'FW_MK', 'FW_PD', 'FW_WA']
-    calender_df = (gas_slp_weekday_params(state, year=year)
-                   .drop(columns=f_wd))
-    temp_calender_df = (pd.concat([calender_df.reset_index(),
-                                   t_allo_df.reset_index()], axis=1))
-
-    if temp_calender_df.isnull().values.any():
-        raise KeyError('The chosen historical weather year and the chosen '
-                       'projected year have mismatching lengths.'
-                       'This could be due to gap years. Please change the '
-                       'historical year in hist_weather_year() in '
-                       'config.py to a year of matching length.')
-
-    temp_calender_df['Tagestyp'] = 'MO'
-    for typ in ['DI', 'MI', 'DO', 'FR', 'SA', 'SO']:
-        (temp_calender_df.loc[temp_calender_df[typ], 'Tagestyp']) = typ
-    list_lk = gv_lk.loc[gv_lk['BL'] == state].index.astype(str)
-    for lk in list_lk:
-        lk_df = pd.DataFrame(index=pd.date_range((str(year) + '-01-01'),
-                                                 periods=hours, freq='H'))
-        tw_df_lk = tw_df.loc[:, int(lk)]
-        tw_df_lk.index = pd.DatetimeIndex(tw_df_lk.index)
-        last_hour = tw_df_lk.copy()[-1:]
-        last_hour.index = last_hour.index + timedelta(1)
-        tw_df_lk = tw_df_lk.append(last_hour)
-        tw_df_lk = tw_df_lk.resample('H').pad()
-        tw_df_lk = tw_df_lk[:-1]
-
-        temp_cal = temp_calender_df.copy()
-        temp_cal = temp_cal[['Date', 'Tagestyp', lk]].set_index("Date")
-        last_hour = temp_cal.copy()[-1:]
-        last_hour.index = last_hour.index + timedelta(1)
-        temp_cal = temp_cal.append(last_hour)
-        temp_cal = temp_cal.resample('H').pad()
-        temp_cal = temp_cal[:-1]
-        temp_cal['Stunde'] = pd.DatetimeIndex(temp_cal.index).time
-        temp_cal = temp_cal.set_index(["Tagestyp", lk, 'Stunde'])
-
-        for slp in list(dict.fromkeys(slp_wz_g().values())):
-            f = ('Lastprofil_{}.xls'.format(slp))
-            slp_profil = pd.read_excel(data_in('temporal',
-                                               'Gas Load Profiles', f))
-            slp_profil = pd.DataFrame(slp_profil.set_index(['Tagestyp',
-                                        'Temperatur\nin °C\nkleiner']))
-            slp_profil.columns = pd.to_datetime(slp_profil.columns,
-                                                format='%H:%M:%S')
-            slp_profil.columns = pd.DatetimeIndex(slp_profil.columns).time
-            slp_profil = slp_profil.stack()
-            temp_cal['Prozent'] = [slp_profil[x] for x in temp_cal.index]
-            for wz in [k for k, v in slp_wz_g().items() if v.startswith(slp)]:
-                lk_df[str(lk) + '_' + str(wz)] = (tw_df_lk[wz].values
-                                                  * temp_cal['Prozent']
-                                                  .values/100)
-                df[str(lk) + '_' + str(wz)] = (tw_df_lk[wz].values
-                                               * temp_cal['Prozent']
-                                               .values/100)
-
-        df[str(lk)] = lk_df.sum(axis=1)
-    if detailed:
-        df = df.drop(columns=gv_lk.index.astype(str))
-        df.columns =\
-            pd.MultiIndex.from_tuples([(int(x), int(y)) for x, y in
-                                       df.columns.str.split('_')])
+        path = data_out('CTS_gas_tempinde_detailed_' + str(state) + '_'
+                        + str(year) + '.csv')
+    if os.path.exists(path):
+        logger.info('Reading temperature independent gas demand'
+                    ' timeseries from hard drive.')
+        if not detailed:
+            gas_total = pd.read_csv(path, index_col=0)
+            gas_total.index = pd.to_datetime(gas_total.index)
+            gas_total.columns = gas_total.columns.astype(int)
+        else:
+            gas_total = pd.read_csv(path, header=[0, 1], index_col=0)
+            gas_total.index = pd.to_datetime(gas_total.index)
+            gas_total.columns = gas_total.columns.set_levels(
+                [gas_total.columns.levels[0].astype(int),
+                 gas_total.columns.levels[1].astype(int)])
+        if use_nuts3code:
+            gas_total = gas_total.rename(columns=dict_region_code(
+                level='lk', keys='ags_lk', values='natcode_nuts3'),
+                level=(0 if detailed else None))
+        return gas_total
+    # if does not exist on hard drive, calculate
     else:
-        df = df[gv_lk.index.astype(str)]
+        # check if gap year
+        if ((year % 4 == 0) & (year % 100 != 0) | (year % 4 == 0)
+                & (year % 100 == 0) & (year % 400 == 0)):
+            hours = 8784
+        else:
+            hours = 8760
+        temperatur_df = t_allo(year=year)  # get daily allocation temperature
+        # Below 15°C the water heating demand is assumed to be constant
+        temperatur_df.clip(15, inplace=True)
+        # create DataFrame from temperature and use timestamp as index
+        df = pd.DataFrame(0, columns=temperatur_df.columns,
+                          index=pd.date_range((str(year) + '-01-01'),
+                                              periods=hours, freq='H'))
+        # for state in bl_dict().values():
+        logger.info('Working on state: {}.'.format(state))
+        tw_df, gv_lk = disagg_daily_gas_slp_water(state, temperatur_df,
+                                                  year=year)
+        gv_lk = (gv_lk.assign(BL=[bl_dict().get(int(x[:-3]))
+                                  for x in gv_lk.index.astype(str)]))
+        t_allo_df = temperatur_df[gv_lk.loc[gv_lk['BL'] == state]
+                                       .index.astype(str)]
 
-    if use_nuts3code:
-        df = df.rename(columns=dict_region_code(level='lk', keys='ags_lk',
-                                                values='natcode_nuts3'),
-                       level=(0 if detailed else None))
-    return df
+        t_allo_df.values[:] = 100  # changed
+        t_allo_df = t_allo_df.astype('int32')
+
+        f_wd = ['FW_BA', 'FW_BD', 'FW_BH', 'FW_GA', 'FW_GB', 'FW_HA', 'FW_KO',
+                'FW_MF', 'FW_MK', 'FW_PD', 'FW_WA']
+        calender_df = (gas_slp_weekday_params(state, year=year)
+                       .drop(columns=f_wd))
+        temp_calender_df = (pd.concat([calender_df.reset_index(),
+                                       t_allo_df.reset_index()], axis=1))
+
+        if temp_calender_df.isnull().values.any():
+            raise KeyError('The chosen historical weather year and the chosen '
+                           'projected year have mismatching lengths.'
+                           'This could be due to gap years. Please change the '
+                           'historical year in hist_weather_year() in '
+                           'config.py to a year of matching length.')
+
+        temp_calender_df['Tagestyp'] = 'MO'
+        for typ in ['DI', 'MI', 'DO', 'FR', 'SA', 'SO']:
+            (temp_calender_df.loc[temp_calender_df[typ], 'Tagestyp']) = typ
+        list_lk = gv_lk.loc[gv_lk['BL'] == state].index.astype(str)
+        for lk in list_lk:
+            lk_df = pd.DataFrame(index=pd.date_range((str(year) + '-01-01'),
+                                                     periods=hours, freq='H'))
+            tw_df_lk = tw_df.loc[:, int(lk)]
+            tw_df_lk.index = pd.DatetimeIndex(tw_df_lk.index)
+            last_hour = tw_df_lk.copy()[-1:]
+            last_hour.index = last_hour.index + timedelta(1)
+            tw_df_lk = tw_df_lk.append(last_hour)
+            tw_df_lk = tw_df_lk.resample('H').pad()
+            tw_df_lk = tw_df_lk[:-1]
+
+            temp_cal = temp_calender_df.copy()
+            temp_cal = temp_cal[['Date', 'Tagestyp', lk]].set_index("Date")
+            last_hour = temp_cal.copy()[-1:]
+            last_hour.index = last_hour.index + timedelta(1)
+            temp_cal = temp_cal.append(last_hour)
+            temp_cal = temp_cal.resample('H').pad()
+            temp_cal = temp_cal[:-1]
+            temp_cal['Stunde'] = pd.DatetimeIndex(temp_cal.index).time
+            temp_cal = temp_cal.set_index(["Tagestyp", lk, 'Stunde'])
+
+            for slp in list(dict.fromkeys(slp_wz_g().values())):
+                f = ('Lastprofil_{}.xls'.format(slp))
+                slp_profil = pd.read_excel(data_in('temporal',
+                                                   'Gas Load Profiles', f))
+                slp_profil = pd.DataFrame(slp_profil.set_index(
+                    ['Tagestyp', 'Temperatur\nin °C\nkleiner']))
+                slp_profil.columns = pd.to_datetime(slp_profil.columns,
+                                                    format='%H:%M:%S')
+                slp_profil.columns = pd.DatetimeIndex(slp_profil.columns).time
+                slp_profil = slp_profil.stack()
+                temp_cal['Prozent'] = [slp_profil[x] for x in temp_cal.index]
+                for wz in [k for k, v in slp_wz_g().items() if v.startswith(slp)]:
+                    lk_df[str(lk) + '_' + str(wz)] = (tw_df_lk[wz].values
+                                                      * temp_cal['Prozent']
+                                                      .values/100)
+                    df[str(lk) + '_' + str(wz)] = (tw_df_lk[wz].values
+                                                   * temp_cal['Prozent']
+                                                   .values/100)
+
+            df[str(lk)] = lk_df.sum(axis=1)
+        if detailed:
+            df = df.drop(columns=gv_lk.index.astype(str))
+            df.columns =\
+                pd.MultiIndex.from_tuples([(int(x), int(y)) for x, y in
+                                           df.columns.str.split('_')])
+        else:
+            df = df[gv_lk.index.astype(str)]
+            df.columns = df.columns.astype(int)
+        # save to hard drive
+        df.to_csv(path)
+
+        if use_nuts3code:
+            df = df.rename(columns=dict_region_code(level='lk', keys='ags_lk',
+                                                    values='natcode_nuts3'),
+                           level=(0 if detailed else None))
+        return df
 
 
 def disagg_daily_gas_slp_water(state, temperatur_df, **kwargs):
@@ -2841,10 +3315,10 @@ def disagg_daily_gas_slp_water(state, temperatur_df, **kwargs):
         days = 365
     # Gas consumption per disctrict and branch, only get hot water, mechanical
     # energy and process heat of gas demand
-    gv_lk = (disagg_applications(source="gas", sector="CTS",
+    gv_lk = (disagg_applications_eff(source="gas", sector="CTS",
                                  use_nuts3code=False, year=year)
              .reorder_levels(order=[1, 0], axis=1)
-             .loc[:, ['Warmwasser', 'Mechanische \nEnergie', 'Prozesswärme']]
+             .loc[:, ['Warmwasser', 'Mechanische Energie', 'Prozesswärme']]
              .sum(level=1, axis=1))
     gv_lk.columns.name = None
     gv_lk_return = gv_lk.copy()  # save for later return
@@ -2891,6 +3365,6 @@ def disagg_daily_gas_slp_water(state, temperatur_df, **kwargs):
     df = pd.concat([df, tageswerte.iloc[:days]], axis=1)
     df = df.iloc[days:]
     df.columns =\
-                pd.MultiIndex.from_tuples([(int(x), int(y)) for x, y in
-                                           df.columns.str.split('_')])
+        pd.MultiIndex.from_tuples([(int(x), int(y)) for x, y in
+                                   df.columns.str.split('_')])
     return [df, gv_lk_return]

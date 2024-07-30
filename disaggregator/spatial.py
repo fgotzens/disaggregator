@@ -363,6 +363,12 @@ def disagg_CTS_industry(source, sector,
 
     Returns
     -------
+    tuple of 3 pd.DataFrames:
+        1st DataFrame: regional consumption
+        2nd DataFrame: share of industrial electricity consumption without
+            self-gen (industrial powerplants generation)
+        3rd DataFrame: share of industrial gas consumption without
+            self-gen (industrial powerplants gas consumption)
     pd.DataFrame
         index = Branches
         columns = Districts
@@ -417,7 +423,7 @@ def disagg_applications(source, sector, disagg_ph=False, use_nuts3code=False,
     sector : str
         must be one of ['CTS', 'industry']
     disagg_ph : bool, default False
-        If True: returns industrial gas consumption fpr process heat by
+        If True: returns industrial gas consumption for process heat by
                  temperature level
     use_nuts3code : bool, default False
         throughput for
@@ -452,6 +458,14 @@ def disagg_applications(source, sector, disagg_ph=False, use_nuts3code=False,
         eev = pd.read_excel(PATH, sheet_name=("Endenergieverbrauch Strom"))
         eev.drop(['Strom Netzbezug', 'Strom Eigenerzeugung'],
                  axis=1, inplace=True)
+        if disagg_ph:  # read temperature level disaggregation factors
+            ft = pd.read_excel(PATH,
+                               sheet_name=("Prozesswärme_Temperaturniveaus"))
+            # cleaning the table
+            # selecting only the rows with WZ and not the name columns
+            ft_clean = ft.loc[[isinstance(x, int) for x in ft["WZ"]]]
+            # use WZ as index for further operations
+            ft_clean = ft_clean.set_index("WZ")
 
     if source == "gas":
         eev = pd.read_excel(PATH, sheet_name=("Endenergieverbrauch Gas"))
@@ -505,25 +519,19 @@ def disagg_applications(source, sector, disagg_ph=False, use_nuts3code=False,
         # kepping only the data for the branches that are relevant
         usage = eev_clean.loc[ec.index]
         if disagg_ph:
-            # check if disaggregation per temperature level is wanted
-            if source == "power":
-                # check if source is power, in this case there is no
-                # disaggregation on temperature-level possible
-                print("Message: No disaggregation on temperature-levels has "
-                      "been done, since there is no data for electricity.")
-            else:
-                # disaggregate process heat into temperature levels by
-                # multipling factor for process heat with factors for
-                # temperature levels
-                usage = (usage.join(ft_clean[['Prozesswärme <100°C',
-                                              'Prozesswärme 100°C-200°C',
-                                              'Prozesswärme 200°C-500°C',
-                                              'Prozesswärme >500°C']]
-                                    .multiply(usage['Prozesswärme'],
-                                              axis='index'))
-                         # drop coloumn process heat, since it is now split
-                         # into temperature- levels and not needed anymore
-                         .drop('Prozesswärme', axis=1))
+            # Check if disaggregation per temperature level is wanted.
+            # Disaggregate process heat into temperature levels by
+            # multipling factor for process heat with factors for
+            # temperature levels.
+            usage = (usage.join(ft_clean[['Prozesswärme <100°C',
+                                          'Prozesswärme 100°C-200°C',
+                                          'Prozesswärme 200°C-500°C',
+                                          'Prozesswärme >500°C']]
+                                .multiply(usage['Prozesswärme'],
+                                          axis='index'))
+                     # drop coloumn process heat, since it is now split
+                     # into temperature- levels and not needed anymore
+                     .drop('Prozesswärme', axis=1))
     # for better acces, transpose DataFrame to have NUTS3-regions in index
     ec = ec.T
     # creating the multiindex
@@ -560,7 +568,7 @@ def disagg_applications(source, sector, disagg_ph=False, use_nuts3code=False,
 
 
 def disagg_applications_eff(source, sector, disagg_ph=False,
-                            use_nuts3code=False, no_self_gen=True, **kwargs):
+                            use_nuts3code=False, no_self_gen=False, **kwargs):
     """
     
     Parameters
@@ -602,7 +610,10 @@ def disagg_applications_eff(source, sector, disagg_ph=False,
     df_eff = efficiency_effect_app(source, sector, year=year)
 
     # multiply consumption reduction due to efficiency gains with
-    df_app_eff = df_app.multiply(df_eff, level=1, axis=1)
+    if sector == 'CTS':
+        df_app_eff = df_app.multiply(df_eff, level=1, axis=1)
+    else:
+        df_app_eff = df_app.multiply(df_eff, level=0, axis=1)
 
     return df_app_eff
 

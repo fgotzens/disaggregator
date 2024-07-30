@@ -31,6 +31,7 @@ from .config import (get_config, data_in, data_out, database_raw,
                      hist_weather_year, gas_load_profile_parameters_dict,
                      blp_branch_cts_power)
 import itertools
+import os
 logger = logging.getLogger(__name__)
 
 
@@ -305,61 +306,70 @@ def generate_specific_consumption_per_branch(**kwargs):
     year1 = year
     if year1 not in range(2000, 2051):
         raise ValueError("`year` must be between 2000 and 2050")
-    while(x):
-        try:
-            vb_wz = database_get('spatial', table_id=71, year=year1)
-            x = False
-        except ValueError:
-            year1 -= 1
-    # convert internal ids to industry_id and energycarrier_id
-    vb_wz = (vb_wz.assign(WZ=[x[0] for x in vb_wz['internal_id']],
-                          ET=[x[1] for x in vb_wz['internal_id']]))
-    # Filter by 12 = gas, 18 = power
-    vb_wz = (vb_wz[(vb_wz['ET'] == 12)
-                   | (vb_wz['ET'] == 18)])[['value', 'WZ', 'ET']]
-    # convert internal_id[0] into WZ number
-    vb_wz = vb_wz.loc[vb_wz['WZ']
-                      .isin(list(wz_dict().keys()))]
-    vb_wz = vb_wz.replace({'WZ': wz_dict()})
-    # create dataframe with tuples von (12,18) und (wz_dict.keys()) for testing
-    # if fetch from database was complete
-    ET = (12, 18)
-    WZ = wz_dict().values()
-    lists = [WZ, ET]
-    df_test = pd.DataFrame(list(itertools.product(*lists)),
-                           columns=['WZ', 'ET'])
-    vb_wz = pd.merge(vb_wz, df_test, how='right', left_on=['WZ', 'ET'],
-                     right_on=['WZ', 'ET']).drop_duplicates()  # .fillna(0)
-    # if there are any missing values, call same table from following year and
-    # replace the missing values
-    x = vb_wz.isnull().values.any()
-    year2 = year1+1
-    while (x):
-        logger.info('The following data was missing for the requested year: '
-                    + str(year1))
-        for i, row in vb_wz.loc[vb_wz['value'].isnull() == True].iterrows():
-            logger.info('WZ: '+str(row['WZ'])
-                        + ' and energy carrier: '+str(row['ET'])
-                        + ' with 18 = electricity and 12 = gas.')
-        vb_wz_2 = database_get('spatial', table_id=71, year=year2)
-        vb_wz_2 = (vb_wz_2.assign(WZ=[x[0] for x in vb_wz_2['internal_id']],
-                                  ET=[x[1] for x in vb_wz_2['internal_id']]))
-        vb_wz_2 = (vb_wz_2[(vb_wz_2['ET'] == 12)
-                   | (vb_wz_2['ET'] == 18)])[['value', 'WZ', 'ET']]
-        vb_wz_2 = vb_wz_2.loc[vb_wz_2['WZ']
-                              .isin(list(wz_dict().keys()))]
-        vb_wz_2 = vb_wz_2.replace({'WZ': wz_dict()})
-        vb_wz_2 = pd.merge(vb_wz_2, df_test, how='right', left_on=['WZ', 'ET'],
-                           right_on=['WZ', 'ET']).drop_duplicates()
-        vb_wz = vb_wz.fillna(vb_wz_2)
-        year2 += 1
+    if year1 > 2017:  # HACK this and the following 3 lines have to be removed
+        if year1 > 2019:
+            year1 = 2019
+        sv_wz_real, gv_wz_real = read_ugr_from_data_in(year1)
+
+        # vb_wz = database_get('spatial', table_id=71, year=2017)
+        # year1 = 2017
+        x = False
+    else:
+        while(x):
+            try:
+                vb_wz = database_get('spatial', table_id=71, year=year1)
+                x = False
+            except ValueError:
+                year1 -= 1
+        # convert internal ids to industry_id and energycarrier_id
+        vb_wz = (vb_wz.assign(WZ=[x[0] for x in vb_wz['internal_id']],
+                              ET=[x[1] for x in vb_wz['internal_id']]))
+        # Filter by 12 = gas, 18 = power
+        vb_wz = (vb_wz[(vb_wz['ET'] == 12)
+                       | (vb_wz['ET'] == 18)])[['value', 'WZ', 'ET']]
+        # convert internal_id[0] into WZ number
+        vb_wz = vb_wz.loc[vb_wz['WZ']
+                          .isin(list(wz_dict().keys()))]
+        vb_wz = vb_wz.replace({'WZ': wz_dict()})
+        # create dataframe with tuples von (12,18) und (wz_dict.keys()) for testing
+        # if fetch from database was complete
+        ET = (12, 18)
+        WZ = wz_dict().values()
+        lists = [WZ, ET]
+        df_test = pd.DataFrame(list(itertools.product(*lists)),
+                               columns=['WZ', 'ET'])
+        vb_wz = pd.merge(vb_wz, df_test, how='right', left_on=['WZ', 'ET'],
+                         right_on=['WZ', 'ET']).drop_duplicates()  # .fillna(0)
+        # if there are any missing values, call same table from following year and
+        # replace the missing values
         x = vb_wz.isnull().values.any()
-        if not x:
-            logger.info('The values were replaced with data from year: '
-                        + str(year2))
-    # continue with procedure here: create DF for electricity and
-    # gas consumption
-    sv_wz_real, gv_wz_real = reshape_energy_consumption_df(vb_wz, year=year)
+        year2 = year1+1
+        while (x):
+            logger.info('The following data was missing for the requested year: '
+                        + str(year1))
+            for i, row in vb_wz.loc[vb_wz['value'].isnull() == True].iterrows():
+                logger.info('WZ: '+str(row['WZ'])
+                            + ' and energy carrier: '+str(row['ET'])
+                            + ' with 18 = electricity and 12 = gas.')
+            vb_wz_2 = database_get('spatial', table_id=71, year=year2)
+            vb_wz_2 = (vb_wz_2.assign(WZ=[x[0] for x in vb_wz_2['internal_id']],
+                                      ET=[x[1] for x in vb_wz_2['internal_id']]))
+            vb_wz_2 = (vb_wz_2[(vb_wz_2['ET'] == 12)
+                       | (vb_wz_2['ET'] == 18)])[['value', 'WZ', 'ET']]
+            vb_wz_2 = vb_wz_2.loc[vb_wz_2['WZ']
+                                  .isin(list(wz_dict().keys()))]
+            vb_wz_2 = vb_wz_2.replace({'WZ': wz_dict()})
+            vb_wz_2 = pd.merge(vb_wz_2, df_test, how='right', left_on=['WZ', 'ET'],
+                               right_on=['WZ', 'ET']).drop_duplicates()
+            vb_wz = vb_wz.fillna(vb_wz_2)
+            year2 += 1
+            x = vb_wz.isnull().values.any()
+            if not x:
+                logger.info('The values were replaced with data from year: '
+                            + str(year2))
+        # continue with procedure here: create DF for electricity and
+        # gas consumption
+        sv_wz_real, gv_wz_real = reshape_energy_consumption_df(vb_wz, year=year)
 
     # project energy demand per wz to given year using activity drivers from
     # input files. For industry gross value added (gva) per branch is used, for
@@ -376,13 +386,15 @@ def generate_specific_consumption_per_branch(**kwargs):
     # calculate specific consumption
     spez_gv = (pd.DataFrame(bze_lk_wz.transpose().drop_duplicates()
                             .sum(axis=1))
-                 .merge(gv_wz_real, left_index=True, right_index=True))
+                 .merge(gv_wz_real, left_index=True,
+                        right_index=True))
     spez_gv.loc[:, 'spez. GV'] = ((spez_gv['GV WZ [MWh]'] / spez_gv[0])
                                   .transpose())
     spez_gv = spez_gv[['spez. GV']].transpose()
     spez_sv = (pd.DataFrame(bze_lk_wz.transpose().drop_duplicates()
                             .sum(axis=1))
-                 .merge(sv_wz_real, left_index=True, right_index=True))
+                 .merge(sv_wz_real, left_index=True,
+                        right_index=True))
     spez_sv.loc[:, 'spez. SV'] = spez_sv['SV WZ [MWh]'] / spez_sv[0]
     spez_sv = spez_sv[['spez. SV']].transpose()
     # assign specific consumption of grouped industry branches to each branch
@@ -524,12 +536,16 @@ def generate_specific_consumption_per_branch_and_district(iterations_power=8,
         x = False
         print('Regional energy consumption of 2003 was used for calibration \n'
               'of industrial energy consumption.')
-    while(x):
-        try:
-            vb_LK = database_get('spatial', table_id=15, year=year1)
-            x = False
-        except ValueError:
-            year1 -= 1
+    if year1 > 2017:  # HACK this and the following 3 lines have to be removed
+        vb_LK = database_get('spatial', table_id=15, year=2017)
+        x = False
+    else:
+        while(x):
+            try:
+                vb_LK = database_get('spatial', table_id=15, year=year1)
+                x = False
+            except ValueError:
+                year1 -= 1
     vb_LK.loc[:, 'Verbrauch in MWh'] = vb_LK['value'] / 3.6
     vb_LK.loc[:, 'id_region'] = vb_LK['id_region'].astype(str)
     vb_LK = (vb_LK.assign(ags=[int(x[:-3]) for x in vb_LK['id_region']],
@@ -1327,7 +1343,7 @@ def efficiency_effect_app(source, sector, **kwargs):
     per application. Positive efficiency enhancement will decrease specific
     energy consumption. Negative efficiency enhancement will increase specific
     energy consumption. Efficiency enhancement rates are considered from year
-    2018 onwards.
+    2019 onwards.
 
     Parameters
     ----------
@@ -1353,8 +1369,8 @@ def efficiency_effect_app(source, sector, **kwargs):
         eff_rate = (pd.read_excel(
             data_in('temporal',
                     'Efficiency_Enhancement_Rates_Applications.xlsx'),
-            sheet_name="eff_enhance_el_industry")
-               .set_index('until year'))
+            sheet_name="eff_enhance_industry")
+               .set_index('WZ')).transpose()
     elif ((sector == 'CTS') & (source == 'gas')):
         eff_rate = (pd.read_excel(
             data_in('temporal',
@@ -1365,17 +1381,17 @@ def efficiency_effect_app(source, sector, **kwargs):
         eff_rate = (pd.read_excel(
             data_in('temporal',
                     'Efficiency_Enhancement_Rates_Applications.xlsx'),
-            sheet_name="eff_enhance_gas_industry")
-               .set_index('until year'))
+            sheet_name="eff_enhance_industry")
+               .set_index('WZ')).transpose()
 
     # if year is in the future, function returns a df with calculated
-    # enhancement-levels based on year 2018
-    if year in range(2019, 2051):
+    # enhancement-levels based on year 2019
+    if year in range(2020, 2051):
         # calculate percentage of consumption reduction
         # due to efficiency effect
-        df = (pow((-eff_rate.iloc[0] + 1), min((year - 2018), (2035 - 2018)))
+        df = (pow((-eff_rate.iloc[0] + 1), min((year - 2019), (2035 - 2019)))
               * pow((-eff_rate.iloc[1] + 1), max((year - 2035), (0))))
-    elif (year <= 2018):
+    elif (year <= 2019):
         # if year is below 2019, function returns df with the same format as
         # above, but only with "1"-entries.
         df = pow((-eff_rate.iloc[0] + 1), 0)
@@ -1383,20 +1399,6 @@ def efficiency_effect_app(source, sector, **kwargs):
         raise ValueError("`year` must be lower than 2050.")
 
     return df
-
-
-def get_current_efficiency_level():  # TBD!
-    """
-    Returns current efficiency level.
-
-    Returns
-    -------
-    None.
-
-    """
-    # Idee: DataFrame für power, DataFrame für gas mit columns = applications,
-    # rows = year
-    return 0.9
 
 
 def get_WZ_for_sector(sector):
@@ -1700,7 +1702,7 @@ def zve_load_profile_elc(region='AllRegions', year=2015, **kwargs):
                        infer_datetime_format=True, engine='c')
 
 
-def shift_load_profile_generator(state, low=0.4, **kwargs):
+def shift_load_profile_generator(state, low=0.5, **kwargs):
     """
     Return shift load profiles in normalized units
     ('normalized' means that the sum over all time steps equals to one).
@@ -2052,8 +2054,26 @@ def reshape_load_profiles(freq=None, key=None, **kwargs):
         else:
             freq = cfg[key]['freq']
 
+    if year in [2020, 2025, 2035, 2045]:
+        source = 'local'
+
     if source == 'local':
-        raise NotImplementedError('Not here yet!')
+        # raise NotImplementedError('Not here yet!')
+        path = data_in('temporal', 'BLP')
+        lst = os.listdir(path)
+        f = list(filter(lambda k: (str(wz) in k) & (str(year) in k), lst))[0]
+        filepath = data_in('temporal', 'BLP', f)
+
+        df_1 = (pd.read_csv(filepath, skiprows=[2], index_col=0, sep=';',
+                            decimal=',')
+                .filter(regex='Mean')
+                .rename(columns=lambda x: str(x)[-5:])
+                .rename(columns=lambda x: x.lstrip('0')))
+        df_1.columns = df_1.columns.astype(int)
+        df_1.set_index(pd.to_datetime(df_1.index), inplace=True)
+
+        return df_1
+
     elif source == 'database':
         df = (database_get_load_profiles('regional_load_profiles', year=year,
                                          region_id=region, wz_id=wz,
@@ -2073,11 +2093,11 @@ def reshape_load_profiles(freq=None, key=None, **kwargs):
 
         df_exp = (pd.DataFrame(df.values.tolist(), index=df.index)
                     .astype(float))
+        return df_exp.pipe(transpose_spatiotemporal, year=year, freq=freq)
+
     else:
         raise KeyError('Wrong source key given in config.yaml - must be either'
                        ' `local` or `database` but is: {}'.format(source))
-
-    return df_exp.pipe(transpose_spatiotemporal, year=year, freq=freq)
 
 
 def reshape_spatiotemporal(freq=None, key=None, **kwargs):
@@ -2156,12 +2176,18 @@ def project_energy_consumption(df_elec_con, df_gas_con, year_projected,
     # normalize Dataframe based on year of the last available dataset
     df_driver_norm = df_driver_total.apply(lambda x: x/x.loc[year_dataset])
     # multiply electricity and gas consumption with projected driver
-    df_elec_con_projected = (df_elec_con.T
-                             .multiply(df_driver_norm.loc[year_projected]).T)
-    df_gas_con_projected = (df_gas_con.T
-                            .multiply(df_driver_norm.loc[year_projected]).T)
+    df_elec_con_projected = pd.Series(dtype='float', name=df_elec_con.name,
+                                      data=(df_elec_con.T
+                                            .multiply(df_driver_norm
+                                                      .loc[year_projected])
+                                            .T))
+    df_gas_con_projected = pd.Series(dtype='float', name=df_gas_con.name,
+                                     data=(df_gas_con.T
+                                           .multiply(df_driver_norm
+                                                     .loc[year_projected])
+                                           .T))
     # WZ 35 is dropped
-    return df_elec_con_projected.dropna(), df_gas_con_projected.dropna()
+    return df_elec_con_projected.dropna().rename('SV WZ [MWh]'), df_gas_con_projected.dropna().rename('GV WZ [MWh]')
 
 
 def reshape_activity_drivers(df_driver_industry, df_driver_cts, columns):
@@ -2255,6 +2281,28 @@ def read_employee_projection():
     return df_driver_industry, df_driver_cts
 
 
+def read_ugr_from_data_in(year):
+    """
+    Reads input file from data_in with gas and elec consumption.
+    Datasource = Umweltökonomische Gesamtrechnung
+
+    Returns
+    -------
+    sv_wz_real : pd.Series
+        contains electricity consumption per branch
+    gv_wz_real : pd.Series
+        contains gas consumption per branch
+
+    """
+
+    ec_wz_real = (pd.read_excel(data_in('dimensionless',
+                                        'ugr_' + str(year) + '.xlsx'),
+                                index_col=0, header=0)
+                  * 1000 / 3.6)
+    ec_wz_real.index = ec_wz_real.index.astype(str)
+    return ec_wz_real['SV WZ [MWh]'], ec_wz_real['GV WZ [MWh]']
+
+
 def reshape_energy_consumption_df(ec_df, year):
     """
     Reshapes DataFrame obtained from database and and returns one DF with
@@ -2300,7 +2348,11 @@ def reshape_energy_consumption_df(ec_df, year):
     elif(year == 2016):
         sv_wz_real.loc['21'] = 1759722
         gv_wz_real.loc['20'] = 88759166.67
-
+    elif(year == 2018):
+        gv_wz_real.loc['49'] = 63845.888
+    elif(year > 2018):
+        gv_wz_real.loc['49'] = 70238.285
+        
     return sv_wz_real, gv_wz_real
 
 

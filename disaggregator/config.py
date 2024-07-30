@@ -51,7 +51,7 @@ def get_config(filename=None, use_ruamel=True, **kwargs):
     """
     if use_ruamel:
         # This one supports YAML Spec 1.2 w/o the problems mentioned below.
-        import ruamel_yaml
+        import ruamel.yaml
     else:
         # Warning: As of 11/2020 PyYAML only supports YAML Spec 1.1, which can
         # cause problems as many expressions (e.g. N) are interpreted as bool.
@@ -70,7 +70,7 @@ def get_config(filename=None, use_ruamel=True, **kwargs):
 
     if use_ruamel:
         with open(filename) as f:
-            config = ruamel_yaml.load(f, Loader=ruamel_yaml.Loader)
+            config = ruamel.yaml.load(f, Loader=ruamel.yaml.Loader)
     else:
         yaml_ver = [int(v) for v in yaml.__version__.split('.')]
         if (yaml_ver[0] > 5) or (yaml_ver[0] == 5 and yaml_ver[1] >= 1):
@@ -268,14 +268,17 @@ def hist_weather_year():
     """
     Assign temperature data of a historical year to a future year.
     """
-    return {2000: 2000, 2001: 2001, 2002: 2002, 2003: 2003, 2004: 2004,
-            2005: 2005, 2006: 2006, 2007: 2007, 2008: 2008, 2009: 2009,
+    return {2000: 2008, 2001: 2009, 2002: 2010, 2003: 2011, 2004: 2012,
+            2005: 2013, 2006: 2006, 2007: 2007, 2008: 2008, 2009: 2009,
             2010: 2010, 2011: 2011, 2012: 2012, 2013: 2013, 2014: 2014,
-            2015: 2015, 2016: 2016, 2017: 2017, 2018: 2018, 2019: 2007,
+            2015: 2015, 2016: 2012, 2017: 2017, 2018: 2018, 2019: 2007,
             2020: 2008, 2021: 2009, 2022: 2010, 2023: 2011, 2024: 2012,
-            2025: 2013, 2026: 2014, 2027: 2015, 2028: 2016, 2029: 2017,
-            2030: 2018, 2031: 2007, 2032: 2008, 2033: 2009, 2034: 2010,
-            2035: 2021}
+            2025: 2013, 2026: 2014, 2027: 2015, 2028: 2012, 2029: 2017,
+            2030: 2018, 2031: 2006, 2032: 2008, 2033: 2009, 2034: 2010,
+            2035: 2011, 2036: 2008, 2037: 2013, 2038: 2014, 2039: 2015,
+            2040: 2012, 2041: 2017, 2042: 2018, 2043: 2007, 2044: 2008,
+            2045: 2009, 2046: 2010, 2047: 2011, 2048: 2012, 2049: 2013,
+            2050: 2014}
 
 
 def bl_dict():
@@ -285,6 +288,36 @@ def bl_dict():
     return {1: 'SH', 2: 'HH', 3: 'NI', 4: 'HB', 5: 'NW', 6: 'HE',
             7: 'RP', 8: 'BW', 9: 'BY', 10: 'SL', 11: 'BE', 12: 'BB',
             13: 'MV', 14: 'SN', 15: 'ST', 16: 'TH'}
+
+def get_bl_ags_dict(region_code='ags'):
+    """
+    Get a dictionary with ags or nuts3 codes as keys and Bundesländer codes
+    as values
+    -------
+    Parameters
+    -------
+    region_code : str
+        must be in ['ags', 'nuts3']
+
+    Returns
+    -------
+    dictionary
+
+    """
+    assert region_code in ['ags', 'nuts3'], ("'region_code' needs to be in "
+                                             "['ags', 'nuts3']")
+    df = dict_region_code(raw=True)
+
+    list_ags = df.ags_lk.values.astype(str)
+    list_nuts3 = df.natcode_nuts3.values
+    list_bl = [bl_dict().get(int(i[: -3])) for i in list_ags]
+
+    if region_code == 'ags':
+        ags_bl_dict = dict(zip(list_ags, list_bl))
+    else:
+        ags_bl_dict = dict(zip(list_nuts3, list_bl))
+
+    return ags_bl_dict
 
 
 def slp_branch_cts_power():
@@ -372,6 +405,29 @@ def shift_profile_industry():
             23: 'S3_WT_SA_SO', 24: 'S3_WT_SA_SO', 25: 'S3_WT', 26: 'S2_WT',
             27: 'S2_WT_SA', 28: 'S2_WT', 29: 'S3_WT', 30: 'S3_WT_SA_SO',
             31: 'S1_WT_SA', 32: 'S3_WT_SA_SO', 33: 'S2_WT_SA'}
+
+
+def get_efficiency_level(key):
+    """
+    Returns value for given key from dictionary with efficiencies of
+    gas applications.
+    
+    Returns
+    -------
+    dict
+
+    """
+    eff_gas_dict = {'Mechanische Energie': 0.4,
+                    'Nichtenergetische Nutzung': 0.7,
+                    'Prozesswärme': 0.96,
+                    'Prozesswärme 100°C-200°C': 0.9,
+                    'Prozesswärme 200°C-500°C': 0.9,
+                    'Prozesswärme <100°C': 0.96,
+                    'Prozesswärme >500°C': 0.8,
+                    'Raumwärme': 0.96,
+                    'Warmwasser': 0.96}
+    return eff_gas_dict[key]
+    
 
 
 def gas_load_profile_parameters_dict():
